@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { TelegramInstanceCoordinator, telegramTokenHash } from "../instance-coordinator.ts";
 
@@ -155,5 +156,48 @@ describe("TelegramInstanceCoordinator", () => {
         const instance = await readFile(join(namespace, "instances", "instance-a.json"), "utf8");
         const cursor = await readFile(join(namespace, "cursor.json"), "utf8");
         expect(`${active}${instance}${cursor}`).not.toContain(TOKEN);
+    });
+
+    it("survives concurrent multi-instance reconcile without lock ENOENT", async () => {
+        const workers = Array.from({ length: 8 }, (_, index) => create(`instance-${index}`));
+        const rounds = 12;
+
+        // Burst concurrent lock acquisition the same way multi-instance heartbeat does.
+        for (let round = 0; round < rounds; round += 1) {
+            const snapshots = await Promise.all(
+                workers.map((worker, index) => worker.reconcile(heartbeat(`/workspace/${index}`))),
+            );
+            const activeIds = new Set(snapshots.map((snapshot) => snapshot.active.instanceId));
+            expect(activeIds.size).toBe(1);
+            expect(snapshots[0]?.active.instanceId).toMatch(/^instance-/);
+        }
+
+        const namespace = join(rootDir, "tg-runtime", telegramTokenHash(TOKEN));
+        const names = await readdir(namespace);
+        expect(names).not.toContain("state.lock");
+        expect(names.some((name) => name.startsWith("state.lock.candidate-") || name.startsWith("state.lock.stale-"))).toBe(false);
+    });
+
+    it("does not sweep a fresh candidate directory during lock cleanup races", async () => {
+        const namespace = join(rootDir, "tg-runtime", telegramTokenHash(TOKEN));
+        await mkdir(namespace, { recursive: true, mode: 0o700 });
+        const freshCandidate = join(namespace, `state.lock.candidate-${randomUUID()}`);
+        const oldCandidate = join(namespace, `state.lock.candidate-${randomUUID()}`);
+        await mkdir(freshCandidate, { mode: 0o700 });
+        await writeFile(join(freshCandidate, "owner.json"), "{\"id\":\"fresh\"}\n", { mode: 0o600 });
+        await mkdir(oldCandidate, { mode: 0o700 });
+        await writeFile(join(oldCandidate, "owner.json"), "{\"id\":\"old\"}\n", { mode: 0o600 });
+        const oldTime = new Date(Date.now() - 60_000);
+        await utimes(oldCandidate, oldTime, oldTime);
+
+        // A reconcile forces cleanupCoordinatorLockArtifacts on the way in/out.
+        const coordinator = create("instance-a");
+        await coordinator.reconcile(heartbeat("/workspace/a"));
+
+        const names = await readdir(namespace);
+        expect(names).toContain(basename(freshCandidate));
+        expect(names).not.toContain(basename(oldCandidate));
+
+        await rm(freshCandidate, { recursive: true, force: true });
     });
 });

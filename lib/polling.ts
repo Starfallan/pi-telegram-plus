@@ -18,6 +18,8 @@ const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 const POLL_LOCK_STALE_MS = 45_000;
 const POLL_LOCK_TOUCH_MS = 5_000;
+// Keep live candidate dirs long enough that a concurrent stager cannot be swept mid-write.
+const POLL_LOCK_CANDIDATE_MAX_AGE_MS = POLL_LOCK_TOUCH_MS * 2;
 
 type PollingLockOwner = {
   id: string;
@@ -100,16 +102,28 @@ async function removeLockArtifact(path: string, reason: string): Promise<void> {
  * Best-effort cleanup of tombstones left by prior retire/quarantine and of
  * abandoned candidate directories from crashed acquirers. Safe because live locks
  * use the bare `*.lock` name; only suffix artifacts are removed.
+ *
+ * Young `.candidate-*` dirs are retained so a concurrent acquirer staging
+ * owner/heartbeat files is not deleted out from under write/rename.
  */
 async function cleanupPollingLockArtifacts(lockPath: string, retainPath?: string): Promise<void> {
   const dir = dirname(lockPath);
   const base = basename(lockPath);
   const names = await readdir(dir).catch(() => [] as string[]);
+  const cleanedAt = Date.now();
   await Promise.all(names.map(async (name) => {
     if (name === base) return;
-    if (!name.startsWith(`${base}.retired-`) && !name.startsWith(`${base}.candidate-`)) return;
+    const isRetired = name.startsWith(`${base}.retired-`);
+    const isCandidate = name.startsWith(`${base}.candidate-`);
+    if (!isRetired && !isCandidate) return;
     const path = join(dir, name);
     if (retainPath && path === retainPath) return;
+    if (isCandidate) {
+      const ageMs = await stat(path)
+        .then((value) => cleanedAt - value.mtimeMs)
+        .catch(() => Number.POSITIVE_INFINITY);
+      if (ageMs < POLL_LOCK_CANDIDATE_MAX_AGE_MS) return;
+    }
     await removeLockArtifact(path, "remove polling lock artifact failed");
   }));
 }
@@ -150,8 +164,8 @@ async function acquirePollingLock(token: string): Promise<{ owns: () => Promise<
   const candidatePath = `${lockPath}.candidate-${owner.id}`;
   const heartbeatName = `heartbeat-${owner.id}`;
 
-  // Drop leftovers from previous process exits before staging a new candidate.
-  await cleanupPollingLockArtifacts(lockPath);
+  // Drop abandoned leftovers, but retain any in-flight candidate we are about to (re)use.
+  await cleanupPollingLockArtifacts(lockPath, candidatePath);
 
   try {
     await mkdir(candidatePath, { mode: 0o700 });

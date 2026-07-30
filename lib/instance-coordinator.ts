@@ -10,6 +10,8 @@ const DEFAULT_HEARTBEAT_STALE_MS = 12_000;
 const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 const LOCK_RETRY_MS = 40;
+// Candidate dirs must outlive LOCK_WAIT_MS so a waiting acquirer is not swept mid-flight.
+const LOCK_CANDIDATE_MAX_AGE_MS = LOCK_STALE_MS;
 
 export type TelegramInstanceMetadata = {
     id: string;
@@ -94,16 +96,29 @@ async function removeCoordinatorArtifact(path: string, reason: string): Promise<
 /**
  * Best-effort cleanup of lock tombstones and abandoned candidate directories.
  * Live locks use the bare `state.lock` name; only suffix artifacts are removed.
+ *
+ * Young `.candidate-*` dirs are retained: concurrent acquirers stage owner.json
+ * inside them, and deleting a live candidate races the stager into ENOENT on
+ * write/rename (multi-instance reconcile hits this every few seconds).
  */
 async function cleanupCoordinatorLockArtifacts(lockPath: string, retainPath?: string): Promise<void> {
     const dir = dirname(lockPath);
     const base = basename(lockPath);
     const names = await readdir(dir).catch(() => [] as string[]);
+    const cleanedAt = Date.now();
     await Promise.all(names.map(async (name) => {
         if (name === base) return;
-        if (!name.startsWith(`${base}.stale-`) && !name.startsWith(`${base}.candidate-`)) return;
+        const isStale = name.startsWith(`${base}.stale-`);
+        const isCandidate = name.startsWith(`${base}.candidate-`);
+        if (!isStale && !isCandidate) return;
         const path = join(dir, name);
         if (retainPath && path === retainPath) return;
+        if (isCandidate) {
+            const ageMs = await stat(path)
+                .then((value) => cleanedAt - value.mtimeMs)
+                .catch(() => Number.POSITIVE_INFINITY);
+            if (ageMs < LOCK_CANDIDATE_MAX_AGE_MS) return;
+        }
         await removeCoordinatorArtifact(path, "remove coordinator lock artifact failed");
     }));
 }
@@ -305,26 +320,37 @@ export class TelegramInstanceCoordinator {
         };
         const ownerPath = join(this.lockPath, "owner.json");
         const candidatePath = `${this.lockPath}.candidate-${owner.id}`;
+        // Candidate dir is private until renamed into place; plain write avoids an
+        // extra temp+rename window concurrent cleaners can interrupt with ENOENT.
+        const ownerBody = `${JSON.stringify(owner, null, 2)}\n`;
 
-        // Drop leftovers from previous process exits before staging a new candidate.
-        await cleanupCoordinatorLockArtifacts(this.lockPath);
-
-        try {
+        const stageCandidate = async (): Promise<void> => {
+            // Drop abandoned leftovers, then stage a fresh private candidate dir.
+            await cleanupCoordinatorLockArtifacts(this.lockPath, candidatePath);
+            await rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
             await mkdir(candidatePath, { mode: 0o700 });
-            await this.writeJsonAtomic(join(candidatePath, "owner.json"), owner);
-        } catch (error) {
-            await rm(candidatePath, { recursive: true, force: true });
-            throw error;
-        }
+            await writeFile(join(candidatePath, "owner.json"), ownerBody, { mode: 0o600, flag: "wx" });
+        };
+
+        const timedOut = (): boolean => Date.now() - started > LOCK_WAIT_MS;
 
         let acquired = false;
         try {
+            await stageCandidate();
             while (true) {
                 try {
                     await rename(candidatePath, this.lockPath);
                     acquired = true;
                     break;
                 } catch (error) {
+                    // Candidate swept mid-flight (or parent vanished): restage and retry.
+                    if (isErrno(error, "ENOENT")) {
+                        if (timedOut()) {
+                            throw new Error("Timed out waiting for Telegram instance coordinator lock");
+                        }
+                        await stageCandidate();
+                        continue;
+                    }
                     if (!isErrno(error, "EEXIST") && !isErrno(error, "ENOTEMPTY")) throw error;
                     const currentOwner = await this.readJson<CoordinatorLockOwner>(ownerPath);
                     const modifiedAt = await stat(this.lockPath).then((value) => value.mtimeMs).catch(() => this.now());
@@ -346,7 +372,7 @@ export class TelegramInstanceCoordinator {
                             }
                         }
                     }
-                    if (Date.now() - started > LOCK_WAIT_MS) {
+                    if (timedOut()) {
                         throw new Error("Timed out waiting for Telegram instance coordinator lock");
                     }
                     await sleep(LOCK_RETRY_MS);
