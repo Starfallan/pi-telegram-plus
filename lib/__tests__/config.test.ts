@@ -1,6 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { resolveTelegramConfigStore } from "../config.ts";
+import { enableConfiguredTelegramOnStartup, resolveTelegramConfigStore } from "../config.ts";
 import type { TelegramConfigStore } from "../types.ts";
+
+describe("enableConfiguredTelegramOnStartup", () => {
+  it("enables a configured bot", () => {
+    expect(enableConfiguredTelegramOnStartup({ botToken: "tok", telegramEnabled: false })).toEqual({
+      botToken: "tok",
+      telegramEnabled: true,
+    });
+  });
+
+  it("leaves an unconfigured bot disabled", () => {
+    const config = { telegramEnabled: false };
+    expect(enableConfiguredTelegramOnStartup(config)).toBe(config);
+  });
+});
 
 describe("resolveTelegramConfigStore", () => {
   const emptyStore: TelegramConfigStore = { version: 2, global: {}, workspaces: [] };

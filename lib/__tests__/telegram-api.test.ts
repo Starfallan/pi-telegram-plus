@@ -79,6 +79,49 @@ describe("createTelegramTransport — network-failure suppression & logging", ()
     expect(logText).not.toMatch(/HTML .*rejected/);
   });
 
+  it("honors Telegram retry_after responses before retrying a send", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const stub = vi.fn(async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      if (bodies.length === 1) {
+        return new Response(JSON.stringify({
+          ok: false,
+          description: "Too Many Requests: retry later",
+          parameters: { retry_after: 0 },
+        }), { status: 429, headers: { "content-type": "application/json" } });
+      }
+      return telegramResponse(true, { message_id: 9 });
+    });
+    globalThis.fetch = stub as unknown as FetchImpl;
+
+    const { transport, setConfig } = makeTransport();
+    setConfig({ botToken: "tok", retryCount: 1 });
+    await expect(transport.sendText(123, "history chunk")).resolves.toEqual([{ message_id: 9 }]);
+
+    expect(stub).toHaveBeenCalledTimes(2);
+    expect(bodies.every((body) => body.parse_mode === "HTML")).toBe(true);
+  });
+
+  it("stops a multi-chunk send when the active-instance generation changes", async () => {
+    let generation = 1;
+    const stub = vi.fn(async () => {
+      generation = 2;
+      return telegramResponse(true, { message_id: 9 });
+    });
+    globalThis.fetch = stub as unknown as FetchImpl;
+    const transport = createTelegramTransport(
+      () => ({ botToken: "tok", retryCount: 0 }),
+      {
+        getSendLease: () => generation,
+        shouldSend: (lease) => lease === generation,
+      },
+    );
+
+    await expect(transport.sendText(123, "history ".repeat(2_000))).rejects.toThrow(/send suppressed/);
+
+    expect(stub).toHaveBeenCalledTimes(1);
+  });
+
   it("sendText includes Telegram topic and source-message reply context", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const stub = vi.fn(async (_url: string, init: RequestInit) => {

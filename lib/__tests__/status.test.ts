@@ -36,6 +36,36 @@ describe("formatTelegramStatusLine", () => {
     expect(result).toContain("disconnected");
   });
 
+  it("shows 'connected' for a paired standby instance", () => {
+    const result = formatTelegramStatusLine(theme, {
+      hasBotToken: true,
+      pollingActive: false,
+      paired: true,
+      connected: true,
+      current: false,
+      botUsername: "mybot",
+    });
+    expect(result).toContain("connected");
+    expect(result).not.toContain("connected(current)");
+    expect(result).toContain("@mybot");
+    expect(result).toContain("[success]");
+  });
+
+  it("shows 'connected(current)' for the current paired instance", () => {
+    const result = formatTelegramStatusLine(theme, {
+      hasBotToken: true,
+      pollingActive: true,
+      paired: true,
+      connected: true,
+      current: true,
+      processing: false,
+      botUsername: "mybot",
+    });
+    expect(result).toContain("connected(current)");
+    expect(result).toContain("@mybot");
+    expect(result).toContain("[success]");
+  });
+
   it("shows 'awaiting pairing' when not paired", () => {
     const result = formatTelegramStatusLine(theme, {
       hasBotToken: true,
@@ -45,14 +75,30 @@ describe("formatTelegramStatusLine", () => {
     expect(result).toContain("awaiting pairing");
   });
 
-  it("shows 'active' when processing", () => {
+  it("shows 'active' when a non-current instance is processing", () => {
     const result = formatTelegramStatusLine(theme, {
       hasBotToken: true,
       pollingActive: true,
       paired: true,
+      connected: true,
+      current: false,
       processing: true,
     });
     expect(result).toContain("active");
+    expect(result).not.toContain("active(current)");
+    expect(result).toContain("[warning]");
+  });
+
+  it("shows 'active(current)' when the current instance is processing", () => {
+    const result = formatTelegramStatusLine(theme, {
+      hasBotToken: true,
+      pollingActive: true,
+      paired: true,
+      connected: true,
+      current: true,
+      processing: true,
+    });
+    expect(result).toContain("active(current)");
     expect(result).toContain("[warning]");
   });
 

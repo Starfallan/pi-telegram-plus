@@ -21,6 +21,11 @@ function emptyStore(): TelegramConfigStore {
   return { version: 2, global: {}, workspaces: [] };
 }
 
+export function enableConfiguredTelegramOnStartup(config: TelegramConfig): TelegramConfig {
+  if (!config.botToken || config.telegramEnabled === true) return config;
+  return { ...config, telegramEnabled: true };
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function withTelegramConfigLock<T>(run: () => Promise<T>): Promise<T> {

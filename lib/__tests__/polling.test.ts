@@ -32,6 +32,27 @@ describe("processTelegramUpdatesBatch", () => {
     expect(errors[0]).toBeInstanceOf(Error);
   });
 
+  it("stops before the next update when the instance loses its active lease", async () => {
+    let config: TelegramConfig = { botToken: "token", lastUpdateId: 30 };
+    let active = true;
+    const handled: number[] = [];
+
+    await processTelegramUpdatesBatch([update(31), update(32)], {
+      getConfig: () => config,
+      setConfig: (next) => {
+        config = next;
+        active = false;
+      },
+      persistConfig: vi.fn(async () => undefined),
+      shouldProcess: () => active,
+      handleUpdate: vi.fn(async (item) => { handled.push(item.update_id); }),
+      onError: vi.fn(),
+    });
+
+    expect(handled).toEqual([31]);
+    expect(config.lastUpdateId).toBe(31);
+  });
+
   it("stops when persisting an update fails so later updates cannot skip it", async () => {
     let config: TelegramConfig = { botToken: "token", lastUpdateId: 20 };
     const handled: number[] = [];

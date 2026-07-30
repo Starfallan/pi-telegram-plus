@@ -42,6 +42,7 @@ const TELEGRAM_MENU_COMMANDS: Array<{ command: string; description: string }> = 
   { command: "tg_global_connect", description: "Enable/start global Telegram bot" },
   { command: "tg_global_disconnect", description: "Disable/stop global Telegram bot" },
   { command: "tg_config", description: "Configure Telegram message rendering" },
+  { command: "tg_switch", description: "Switch the active local pi instance" },
   { command: "tg_list", description: "List Telegram bot bindings" },
 ];
 

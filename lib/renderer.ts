@@ -33,7 +33,7 @@ function formatThinkingInline(part: Record<string, any>, level: TelegramRenderLe
   return `💭 Thinking\n${text}`;
 }
 
-function contentToRenderParts(
+export function contentToRenderParts(
   content: unknown,
   thinkingLevel: TelegramRenderLevel = "brief",
   toolLevel: TelegramRenderLevel = "brief",
@@ -62,7 +62,7 @@ function contentToRenderParts(
   return { body: body.filter(Boolean).join("\n\n"), inlineEvents };
 }
 
-function contentImages(content: unknown): Array<{ data: string; mimeType?: string }> {
+export function contentImages(content: unknown): Array<{ data: string; mimeType?: string }> {
   if (!Array.isArray(content)) return [];
   return content.flatMap((part) => {
     if (!part || typeof part !== "object") return [];
@@ -233,7 +233,7 @@ function summarizeToolResult(result: unknown, max = 96): string {
   return shortenSummary(stringifyShort(result, max), max);
 }
 
-function formatToolFailureBrief(toolName: string, result: unknown, args?: unknown): string {
+export function formatToolFailureBrief(toolName: string, result: unknown, args?: unknown): string {
   const argSummary = summarizeToolArgs(toolName, args, 72);
   const resultSummary = summarizeToolResult(result, 72);
   const summary = argSummary && resultSummary

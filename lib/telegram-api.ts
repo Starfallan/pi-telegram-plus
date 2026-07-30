@@ -13,11 +13,24 @@ type TelegramFileInfo = {
   file_path: string;
 };
 
-type TelegramApiError = {
+type TelegramApiResponse = {
   ok: boolean;
   result?: unknown;
   description?: string;
+  parameters?: { retry_after?: number };
 };
+
+export class TelegramApiRequestError extends Error {
+  readonly retryAfterMs?: number;
+
+  constructor(message: string, retryAfterSeconds?: number) {
+    super(message);
+    this.name = "TelegramApiRequestError";
+    this.retryAfterMs = typeof retryAfterSeconds === "number" && retryAfterSeconds >= 0
+      ? retryAfterSeconds * 1_000
+      : undefined;
+  }
+}
 
 const TELEGRAM_CALLBACK_LIMIT = 64;
 
@@ -64,8 +77,10 @@ export async function telegramApi<T>(
   } catch (error) {
     throw new Error(`Telegram API request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const json = (await response.json()) as TelegramApiError & { result: T };
-  if (!json.ok) throw new Error(json.description ?? `${method} failed`);
+  const json = (await response.json()) as TelegramApiResponse & { result: T };
+  if (!json.ok) {
+    throw new TelegramApiRequestError(json.description ?? `${method} failed`, json.parameters?.retry_after);
+  }
   return json.result;
 }
 
@@ -99,31 +114,48 @@ export async function downloadTelegramFile(token: string, filePath: string, sign
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-export function createTelegramTransport(getConfig: () => TelegramConfig): TelegramTransport {
+export class TelegramSendSuppressedError extends Error {
+  constructor() {
+    super("Telegram send suppressed because this pi instance is not active");
+    this.name = "TelegramSendSuppressedError";
+  }
+}
+
+export function createTelegramTransport(
+  getConfig: () => TelegramConfig,
+  options: {
+    getAbortSignal?: () => AbortSignal | undefined;
+    getSendLease?: () => unknown;
+    shouldSend?: (lease: unknown) => boolean;
+  } = {},
+): TelegramTransport {
   const cfg = () => getConfig();
+  const captureSendLease = () => options.getSendLease?.();
+  const ensureSendAllowed = (lease: unknown) => {
+    if (options.shouldSend && !options.shouldSend(lease)) throw new TelegramSendSuppressedError();
+  };
 
   /** Call a Telegram API method with retry on transient failures. */
-  const callApi = async <T>(method: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<T> => {
+  const callApi = async <T>(method: string, body: Record<string, unknown>, signal: AbortSignal | undefined, lease: unknown): Promise<T> => {
+    const requestSignal = signal ?? options.getAbortSignal?.();
     const token = requireToken();
     const maxRetries = cfg().retryCount ?? 3;
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        return await telegramApi<T>(token, method, body, signal);
+        ensureSendAllowed(lease);
+        return await telegramApi<T>(token, method, body, requestSignal);
       } catch (error) {
         lastError = error;
-        if (attempt >= maxRetries || signal?.aborted) throw error;
-        // Exponential backoff: 500ms, 1s, 2s
-        await sleep(250 * Math.pow(2, attempt));
+        if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || requestSignal?.aborted) throw error;
+        const retryAfterMs = error instanceof TelegramApiRequestError ? error.retryAfterMs : undefined;
+        // Prefer Telegram's explicit flood-control delay; otherwise use exponential backoff.
+        await sleep(retryAfterMs ?? 250 * Math.pow(2, attempt));
       }
     }
     throw lastError;
   };
 
-  /** Non-retrying API call (for idempotent fire-and-forget or catch-suppressed helpers). */
-  const callApiOnce = async <T>(method: string, body: Record<string, unknown>) => {
-    return telegramApi<T>(requireToken(), method, body);
-  };
   const buildInlineKeyboard = (rows: TelegramButton[][]) => ({
     inline_keyboard: rows.map((row: TelegramButton[]) =>
       row.map((button) => {
@@ -155,6 +187,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
    *  it and let existing `.catch(swallow(...))` / status-line reporting
    *  surface the outage instead of pointlessly retrying (and logging). */
   const isNetworkError = (err: unknown): boolean => {
+    if (err instanceof TelegramSendSuppressedError) return true;
     const msg = err instanceof Error ? err.message : String(err);
     // telegramApi wraps raw fetch failures as "Telegram API request failed: <cause>".
     if (msg.startsWith("Telegram API request failed")) return true;
@@ -180,6 +213,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
 
   return {
     async sendText(chatId, text, messageThreadId, replyToMessageId) {
+      const lease = captureSendLease();
       const sent: TelegramSentMessage[] = [];
       // Use the semantic HTML splitter so multi-message sends cut at block
       // boundaries (every chunk is independently valid Telegram HTML) instead
@@ -192,7 +226,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
           parse_mode: "HTML",
           ...messageTargetFields(messageThreadId, replyToMessageId),
         };
-        const msg = await callApi<TelegramSentMessage>("sendMessage", body)
+        const msg = await callApi<TelegramSentMessage>("sendMessage", body, undefined, lease)
           .catch((err) => {
             // Network failure: the plain-text retry will fail identically.
             // Propagate so the caller's `.catch` (or renderer suppression)
@@ -203,7 +237,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
               chat_id: chatId,
               text: stripHtml(chunk),
               ...messageTargetFields(messageThreadId, replyToMessageId),
-            });
+            }, undefined, lease);
           });
         sent.push(msg);
       }
@@ -211,6 +245,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
     },
 
     async sendButtons(chatId, text, rows, messageThreadId, replyToMessageId) {
+      const lease = captureSendLease();
       // Button messages cannot be split without duplicating keyboards, so keep
       // title text short. The UI layer already truncates button labels.
       const reply_markup = buildInlineKeyboard(rows);
@@ -221,7 +256,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
         parse_mode: "HTML",
         reply_markup,
         ...messageTargetFields(messageThreadId, replyToMessageId),
-      }).catch((err) => {
+      }, undefined, lease).catch((err) => {
         if (isNetworkError(err)) throw err;
         warnHtmlFallback("sendButtons", err, first);
         return callApi<TelegramSentMessage>("sendMessage", {
@@ -229,29 +264,31 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
           text: stripHtml(first),
           reply_markup,
           ...messageTargetFields(messageThreadId, replyToMessageId),
-        });
+        }, undefined, lease);
       });
     },
 
     async editText(chatId, messageId, text) {
+      const lease = captureSendLease();
       const first = splitTelegramHtml(text)[0];
       await callApi("editMessageText", {
         chat_id: chatId,
         message_id: messageId,
         text: first,
         parse_mode: "HTML",
-      }).catch((err) => {
+      }, undefined, lease).catch((err) => {
         if (isNetworkError(err)) return; // swallow; nothing useful to retry
         warnHtmlFallback("editMessageText", err, first);
         return callApi("editMessageText", {
           chat_id: chatId,
           message_id: messageId,
           text: stripHtml(first),
-        }).catch(apiLog.swallow("debug", "editMessageText plain-text fallback failed", { chatId, messageId }));
+        }, undefined, lease).catch(apiLog.swallow("debug", "editMessageText plain-text fallback failed", { chatId, messageId }));
       });
     },
 
     async editButtons(chatId, messageId, text, rows) {
+      const lease = captureSendLease();
       const reply_markup = buildInlineKeyboard(rows);
       const first = splitTelegramHtml(text)[0];
       await callApi("editMessageText", {
@@ -260,7 +297,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
         text: first,
         parse_mode: "HTML",
         reply_markup,
-      }).catch((err) => {
+      }, undefined, lease).catch((err) => {
         if (isNetworkError(err)) return; // swallow; nothing useful to retry
         warnHtmlFallback("editButtons", err, first);
         return callApi("editMessageText", {
@@ -268,39 +305,45 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
           message_id: messageId,
           text: stripHtml(first),
           reply_markup,
-        }).catch(apiLog.swallow("debug", "editButtons plain-text fallback failed", { chatId, messageId }));
+        }, undefined, lease).catch(apiLog.swallow("debug", "editButtons plain-text fallback failed", { chatId, messageId }));
       });
     },
 
     async answerCallbackQuery(callbackQueryId, text) {
+      const lease = captureSendLease();
       await callApi("answerCallbackQuery", {
         callback_query_id: callbackQueryId,
         ...(text ? { text } : {}),
-      });
+      }, undefined, lease);
     },
 
     async removeInlineKeyboard(chatId, messageId) {
+      const lease = captureSendLease();
       await callApi("editMessageReplyMarkup", {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: { inline_keyboard: [] },
-      }).catch(apiLog.swallow("debug", "removeInlineKeyboard failed", { chatId, messageId }));
+      }, undefined, lease).catch(apiLog.swallow("debug", "removeInlineKeyboard failed", { chatId, messageId }));
     },
 
     async deleteMessage(chatId, messageId) {
+      const lease = captureSendLease();
       await callApi("deleteMessage", {
         chat_id: chatId,
         message_id: messageId,
-      }).catch(apiLog.swallow("warn", "deleteMessage failed", { chatId, messageId }));
+      }, undefined, lease).catch(apiLog.swallow("warn", "deleteMessage failed", { chatId, messageId }));
     },
 
     async sendDocument(chatId, path, caption, signal, messageThreadId, replyToMessageId) {
+      const lease = captureSendLease();
+      const sendSignal = signal ?? options.getAbortSignal?.();
       const token = requireToken();
       const maxRetries = cfg().retryCount ?? 3;
       const data = await readFile(path);
       let lastError: unknown;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
+          ensureSendAllowed(lease);
           const form = new FormData();
           form.set("chat_id", String(chatId));
           if (messageThreadId !== undefined) form.set("message_thread_id", String(messageThreadId));
@@ -311,10 +354,11 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
           });
           form.set("document", documentBlob, basename(path));
           try {
+            ensureSendAllowed(lease);
             const response = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
               method: "POST",
               body: form,
-              signal,
+              signal: sendSignal,
             });
             const json = await response.json() as { ok: boolean; description?: string };
             if (!json.ok) throw new Error(json.description ?? "sendDocument failed");
@@ -325,7 +369,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
           }
         } catch (error) {
           lastError = error;
-          if (attempt >= maxRetries || signal?.aborted) throw error;
+          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted) throw error;
           await sleep(250 * Math.pow(2, attempt));
         }
       }
@@ -333,11 +377,14 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
     },
 
     async sendPhoto(chatId, data, caption, isPath = false, signal, messageThreadId, replyToMessageId) {
+      const lease = captureSendLease();
+      const sendSignal = signal ?? options.getAbortSignal?.();
       const token = requireToken();
       const maxRetries = cfg().retryCount ?? 3;
       let lastError: unknown;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
+          ensureSendAllowed(lease);
           const form = new FormData();
           form.set("chat_id", String(chatId));
           if (messageThreadId !== undefined) form.set("message_thread_id", String(messageThreadId));
@@ -356,10 +403,11 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
             form.set("photo", new Blob([bytes], { type: mime }), `image.${mime.split("/")[1] ?? "png"}`);
           }
           try {
+            ensureSendAllowed(lease);
             const response = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
               method: "POST",
               body: form,
-              signal,
+              signal: sendSignal,
             });
             const json = await response.json() as { ok: boolean; description?: string };
             if (!json.ok) throw new Error(json.description ?? "sendPhoto failed");
@@ -370,7 +418,7 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
           }
         } catch (error) {
           lastError = error;
-          if (attempt >= maxRetries || signal?.aborted) throw error;
+          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted) throw error;
           await sleep(250 * Math.pow(2, attempt));
         }
       }
@@ -378,11 +426,13 @@ export function createTelegramTransport(getConfig: () => TelegramConfig): Telegr
     },
 
     async sendChatAction(chatId, action, messageThreadId) {
+      const lease = captureSendLease();
+      ensureSendAllowed(lease);
       await telegramApi(requireToken(), "sendChatAction", {
         chat_id: chatId,
         action,
         ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}),
-      }).catch(apiLog.swallow("debug", "sendChatAction failed", { chatId, action, messageThreadId }));
+      }, options.getAbortSignal?.()).catch(apiLog.swallow("debug", "sendChatAction failed", { chatId, action, messageThreadId }));
     },
   };
 }

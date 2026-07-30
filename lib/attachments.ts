@@ -117,6 +117,7 @@ export function registerTelegramAttachmentTool(
   deps: {
     getActiveTurn: () => TelegramTurn | undefined;
     getDefaultChatId?: () => number | undefined;
+    isActive?: () => boolean;
     transport: TelegramTransport;
   },
 ): void {
@@ -132,6 +133,9 @@ export function registerTelegramAttachmentTool(
       paths: Type.Array(Type.String({ description: "Local file path to attach" }), { minItems: 1, maxItems: MAX_ATTACHMENTS_PER_TURN }),
     }),
     async execute(_toolCallId, params) {
+      if (deps.isActive && !deps.isActive()) {
+        throw new Error("tg_attach is unavailable because this pi instance is not active in Telegram");
+      }
       const maxBytes = outboundAttachmentLimit();
       const activeTurn = deps.getActiveTurn();
       const pendingAttachments: ResolvedTelegramAttachment[] = [];

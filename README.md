@@ -2,9 +2,9 @@
 
 ## Overview
 
-**Full Telegram control of [pi coding agent](https://github.com/earendil-works/pi-coding-agent) — commands, interactive UI, model/session management, file transfer, and real-time streaming output, all from Telegram.**
+**Full Telegram control of [pi coding agent](https://github.com/earendil-works/pi-coding-agent) — commands, interactive UI, model/session management, file transfer, multi-instance switching, and real-time streaming output, all from Telegram.**
 
-`pi-telegram-plus` is a pi extension that turns Telegram into a full-featured remote control surface for the pi coding agent. It's not just a notification bot — it mirrors the core pi TUI experience into Telegram, with interactive menus, inline keyboards, file attachments, and live agent output rendering.
+`pi-telegram-plus` is a pi extension that turns Telegram into a full-featured remote control surface for the pi coding agent. It's not just a notification bot — it mirrors the core pi TUI experience into Telegram, with interactive menus, inline keyboards, file attachments, live agent output rendering, and safe coordination when several local pi processes share one bot token.
 
 ---
 
@@ -30,11 +30,16 @@
 
 ### 🤖 Bot Connectivity
 - **Long polling** — receives messages and callback queries in real time
-- **Multi-instance safe** — file-based polling lock prevents multiple pi instances from racing on the same bot token
-- **Automatic reconnection** — exponential backoff on transient failures
-- **Bot command menu sync** — automatically syncs available commands to Telegram's BotMenu (up to 100 commands)
+- **Multi-instance switching** — multiple local pi processes can share one bot token; only one instance is active at a time, selected with `/tg-switch` (see **Multi-instance Coordination**)
+- **Isolated outbound routing** — standby instances cannot leak local assistant output, tool results, UI notifications, typing actions, or `tg_attach` files into the active Telegram chat
+- **Full branch replay** — switching automatically replays the target session's current branch from its first message, including images and the configured `tool` / `thinking` detail levels, then resumes normal routing
+- **Heartbeat failover** — when the active local instance disappears, another live instance claims ownership after its heartbeat expires
+- **Automatic reconnection** — exponential backoff on transient polling failures; a file-based polling lock remains the final safety guard against dual pollers
+- **Shared update cursor** — instances sharing a token keep a coordinated `lastUpdateId`, so handoffs do not re-deliver or skip Telegram updates
+- **Startup auto-enable** — if a bot token is already configured, Telegram is enabled automatically when pi starts (no manual `/tg-*-connect` on every launch)
+- **Bot command menu sync** — automatically syncs available commands to Telegram's BotMenu (up to 100 commands), including `/tg_switch`
 - **Authorized user** — setup generates a one-time local pairing code; the Telegram user must send `/pair <code>` before their user id is persisted; all other users are rejected
-- **TUI status line** — a `telegram+` indicator in the pi status bar shows connection state (connected / active / awaiting pairing / disconnected / not configured / error)
+- **TUI status line** — a right-aligned `telegram+` footer preserves connected / active / awaiting pairing / disconnected / not configured / error states; the owning instance shows `connected(current)` when idle or `active(current)` while processing, together with the bot username
 - **Typing indicator** — sends `typing` chat-action pulses while a turn is active so the Telegram chat shows the bot is working
 - **Forum topic aware** — messages, inline prompts, tool output, attachments, and typing actions preserve Telegram `message_thread_id` so supergroup topics do not cross streams
 - **Quoted message context** — when you reply to a Telegram message, the quoted text/caption and attachment summary are included in the prompt sent to pi so the agent understands what “this” refers to
@@ -108,9 +113,34 @@ are bridged to Telegram inline buttons so remote turns can interact with them:
 ### Command naming
 
 - Commands that mirror pi's native slash commands keep the same names (`/model`, `/session`, `/status`, `/stop`, `/thinking`, etc.) so Telegram behaves like a remote pi control surface instead of a separate bot-specific CLI.
-- Commands that configure or manage the Telegram bridge itself use the `/tg-*` prefix (`/tg-global-setup`, `/tg-config`, `/tg-list`, etc.).
+- Commands that configure or manage the Telegram bridge itself use the `/tg-*` prefix (`/tg-global-setup`, `/tg-config`, `/tg-list`, `/tg-switch`, etc.).
 - `/pair <code>` is a Telegram-only bootstrap authorization message handled before normal command dispatch. It is intentionally short and not `/tg-pair` because the setup prompt is copied into Telegram during first-time pairing, before any user is authorized.
-- Telegram Bot API command menus do not allow hyphens, so the bot menu may show underscore aliases such as `/tg_config` or `/tg_global_setup`; the controller accepts both underscore and hyphen forms.
+- Telegram Bot API command menus do not allow hyphens, so the bot menu may show underscore aliases such as `/tg_config`, `/tg_switch`, or `/tg_global_setup`; the controller accepts both underscore and hyphen forms.
+
+### Multi-instance Coordination
+
+Several local pi processes can share one bot token (for example different workspaces or sessions). Coordination keeps Telegram traffic attached to exactly one owner at a time:
+
+1. **Registration** — each enabled process advertises itself under `~/.pi/agent/` with cwd, session, model, busy state, and a heartbeat.
+2. **Single active owner** — only the active instance polls Telegram and is allowed to send outbound messages. Standby instances stay quiet even if their local agent is streaming.
+3. **Explicit switch** — from the currently active instance, run `/tg-switch` (bot menu: `/tg_switch`):
+   - no args → inline selector listing live instances (`project · session · model · id`)
+   - `/tg-switch <instance-id-prefix>` → switch by id or unambiguous prefix
+   - `/tg-switch current` → keep the current owner and re-run history replay
+4. **History replay** — after a switch, the new owner stops polling briefly, posts a switch banner (cwd / model / message count), replays the current session branch (user/assistant text, images, and tool/thinking blocks at the configured render levels), then posts `History replay complete` and resumes polling.
+5. **Automatic failover** — if the active process dies or stops heartbeating, another live instance claims ownership (`reason: failover`) without a manual `/tg-switch`.
+6. **Safety locks** — coordinator state and the polling lock both clean up abandoned candidate/tombstone artifacts automatically. A live `tg-poll-*.lock` directory is still the last line of defense against two pollers.
+
+TUI footer states for the current process:
+
+| Status text | Meaning |
+|-------------|---------|
+| `telegram+ connected(current) @bot` | This process owns the bot and is idle |
+| `telegram+ active(current) @bot` | This process owns the bot and a turn is in progress |
+| `telegram+ connected @bot` | Bot is up, but another local process is the owner |
+| `telegram+ active @bot` | Another local process owns the bot and is processing |
+| `telegram+ awaiting pairing` | Token present, pairing code not yet consumed |
+| `telegram+ disconnected` / `not configured` / `error …` | Disabled, missing token, or last connection error |
 
 ### Replying to Telegram messages
 
@@ -181,6 +211,7 @@ Quoted attachments are represented as metadata (`[telegram quoted attachment]`, 
 | Command | Description |
 |---------|-------------|
 | `/tg-config` | Configure rendering levels and message mode |
+| `/tg-switch [instance-id\|current]` | Switch the active local pi instance that owns this bot token (bot menu: `/tg_switch`). No args opens an inline selector; an id/prefix targets one live instance; `current` re-replays the active owner. Must be run on the currently active instance. See **Multi-instance Coordination**. |
 
 ### Utility Commands
 
@@ -209,14 +240,23 @@ Common issues and diagnostic steps. The extension writes a structured JSON Lines
 
 ### The bot does not respond to my messages
 - Verify the bot token is correct: run `/tg-global-setup` (global) or `/tg-bind-cwd` (workspace) and re-paste the token from [@BotFather](https://t.me/BotFather).
-- Confirm the bot is connected: `/tg-list` should show the binding as enabled. If not, run `/tg-global-connect` or `/tg-cwd-connect`.
+- Confirm the bot is connected: `/tg-list` should show the binding as enabled. If not, run `/tg-global-connect` or `/tg-cwd-connect`. A configured token is auto-enabled again on the next pi start.
 - Make sure you are the authorized user. After setup, pi prints a one-time pairing code locally; send `/pair <code>` to the bot from your Telegram account. To reset authorization, remove the binding and re-setup.
-- Check that no other pi instance is polling the same token. The file-based polling lock prevents races, but a stuck lock file can block a new instance — restart pi or remove the stale lock if needed.
+- When several local pi processes share the token, check the local TUI footer: only `connected(current)` / `active(current)` owns polling and outbound traffic. From that owner, send `/tg-switch` (bot menu: `/tg_switch`) to inspect and select another live instance. Dead owners fail over automatically after their heartbeat expires.
+- The file-based polling lock remains a final safety guard. If the expected instance is already active but polling still reports a lock conflict, restart the conflicting older process or remove only the confirmed stale `tg-poll-*.lock` directory under `~/.pi/agent/`. Retired/candidate lock leftovers are cleaned automatically and should not need manual deletion.
 
 ### Messages arrive but the agent output is not streamed
 - Confirm pi has an active model and valid credentials: run `/model` and `/status` from Telegram.
-- If `tool` / `thinking` rendering is set to `hidden`, output may look silent. Run `/tg-config tool brief` and `/tg-config thinking brief` to surface activity.
+- Confirm this local process is the Telegram owner (`telegram+ connected(current)` / `active(current)` in the TUI). Standby instances deliberately suppress outbound assistant/tool/UI/`tg_attach` traffic.
+- If a `/tg-switch` just completed, wait until the history-replay banner finishes (`History replay complete`) before expecting new streamed output; outbound sends are gated until replay ends.
+- If `tool` / `thinking` rendering is set to `hidden`, output may look silent. Run `/tg-config tool brief` and `/tg-config thinking brief` to surface activity (these levels also control what history replay includes).
 - Long single messages may exceed Telegram's 4096-byte limit; the extension splits them automatically, but if delivery still fails, check your network and the pi log for upstream API errors.
+
+### `/tg-switch` fails or history replay looks wrong
+- `/tg-switch` only works on the currently active instance. If you see `This pi instance is not the active Telegram instance`, switch from the owner process or wait for failover.
+- The selector only lists processes that are still heartbeating. Restart the missing pi if it does not appear.
+- Replay targets the new owner's current session branch and the chat/topic where the switch was requested. Empty sessions produce a banner with `0 messages` and no body replay.
+- A failed replay posts `History replay failed` in Telegram and still completes the handoff so the new owner can accept fresh messages; check the pi log for details.
 
 ### Interactive dialogs (Select / Confirm / Input / Editor) do not appear
 - Inline keyboards require a recent Telegram client; update your Telegram app.

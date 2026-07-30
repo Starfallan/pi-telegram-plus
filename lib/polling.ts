@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "./config.ts";
 import { getTelegramUpdates } from "./telegram-api.ts";
 import type { TelegramConfig, TelegramUpdate } from "./types.ts";
@@ -71,19 +71,71 @@ async function readPollingLockOwner(ownerPath: string): Promise<PollingLockOwner
   }
 }
 
-async function isPollingLockStale(lockPath: string): Promise<boolean> {
+type PollingLockSnapshot = {
+  exists: boolean;
+  stale: boolean;
+  staleId: string;
+};
+
+async function inspectPollingLock(lockPath: string): Promise<PollingLockSnapshot> {
+  const lockStat = await stat(lockPath).catch(() => undefined);
+  if (!lockStat) return { exists: false, stale: false, staleId: "missing" };
   const ownerPath = join(lockPath, "owner.json");
   const owner = await readPollingLockOwner(ownerPath);
-  const age = Date.now() - (await stat(ownerPath).then((s) => s.mtimeMs).catch(() => 0));
-  if (age > POLL_LOCK_STALE_MS) return true;
-  return owner !== undefined && !isPidAlive(owner.pid);
+  const heartbeatPath = owner ? join(lockPath, `heartbeat-${owner.id}`) : ownerPath;
+  const modifiedAt = await stat(heartbeatPath).then((value) => value.mtimeMs).catch(() => lockStat.mtimeMs);
+  const age = Date.now() - modifiedAt;
+  return {
+    exists: true,
+    stale: owner ? age > POLL_LOCK_STALE_MS || !isPidAlive(owner.pid) : age > POLL_LOCK_STALE_MS,
+    staleId: (owner?.id ?? `unknown-${Math.trunc(modifiedAt)}`).replace(/[^a-zA-Z0-9_-]/g, "_"),
+  };
+}
+
+async function removeLockArtifact(path: string, reason: string): Promise<void> {
+  await rm(path, { recursive: true, force: true }).catch(pollLog.swallow("debug", reason, { path }));
 }
 
 /**
- * Atomically claim the polling lock. Uses a temporary candidate file written
- * with `wx` (exclusive create) inside the agent dir, then renames it into the
- * lock directory. No check-then-rm-then-mkdir TOCTOU window exists: only one
- * process can successfully rename its candidate into the lock's owner.json.
+ * Best-effort cleanup of tombstones left by prior retire/quarantine and of
+ * abandoned candidate directories from crashed acquirers. Safe because live locks
+ * use the bare `*.lock` name; only suffix artifacts are removed.
+ */
+async function cleanupPollingLockArtifacts(lockPath: string, retainPath?: string): Promise<void> {
+  const dir = dirname(lockPath);
+  const base = basename(lockPath);
+  const names = await readdir(dir).catch(() => [] as string[]);
+  await Promise.all(names.map(async (name) => {
+    if (name === base) return;
+    if (!name.startsWith(`${base}.retired-`) && !name.startsWith(`${base}.candidate-`)) return;
+    const path = join(dir, name);
+    if (retainPath && path === retainPath) return;
+    await removeLockArtifact(path, "remove polling lock artifact failed");
+  }));
+}
+
+async function quarantineStalePollingLock(lockPath: string): Promise<boolean> {
+  const snapshot = await inspectPollingLock(lockPath);
+  if (!snapshot.exists) return true;
+  if (!snapshot.stale) return false;
+  const stalePath = `${lockPath}.retired-${snapshot.staleId}`;
+  try {
+    await rename(lockPath, stalePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return true;
+    if (code === "EEXIST" || code === "ENOTEMPTY") return false;
+    throw error;
+  }
+  // Rename frees the live lock path atomically; the tombstone is disposable.
+  await removeLockArtifact(stalePath, "remove retired polling lock failed");
+  return true;
+}
+
+/**
+ * Atomically claim the polling lock by fully preparing an owner directory and
+ * renaming that non-empty candidate into place. No process can observe an
+ * ownerless published lock or overwrite another owner's metadata.
  */
 async function acquirePollingLock(token: string): Promise<{ owns: () => Promise<boolean>; release: () => Promise<void> } | undefined> {
   await mkdir(getAgentDir(), { recursive: true });
@@ -95,55 +147,63 @@ async function acquirePollingLock(token: string): Promise<{ owns: () => Promise<
     at: new Date().toISOString(),
     touchedAt: new Date().toISOString(),
   };
+  const candidatePath = `${lockPath}.candidate-${owner.id}`;
+  const heartbeatName = `heartbeat-${owner.id}`;
 
-  // Clean up stale lock if it exists.
-  if (!await isPollingLockStale(lockPath)) return undefined;
-  await rm(lockPath, { recursive: true, force: true }).catch(pollLog.swallow("debug", "rm stale polling lock failed", { lockPath }));
+  // Drop leftovers from previous process exits before staging a new candidate.
+  await cleanupPollingLockArtifacts(lockPath);
 
-  // Create lock directory; if another process won, bail out.
   try {
-    await mkdir(lockPath, { mode: 0o700 });
+    await mkdir(candidatePath, { mode: 0o700 });
+    await writeFile(join(candidatePath, "owner.json"), ownerText(owner), { mode: 0o600, flag: "wx" });
+    await writeFile(join(candidatePath, heartbeatName), owner.touchedAt, { mode: 0o600, flag: "wx" });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    // Someone else created it after our stale check — their lock is fresh now.
-    return undefined;
-  }
-
-  // Write a temp candidate with exclusive flag, then rename atomically.
-  const tmpPath = join(getAgentDir(), `tg-poll-candidate-${owner.id}.tmp`);
-  try {
-    await writeFile(tmpPath, ownerText(owner), { mode: 0o600, flag: "wx" });
-  } catch (error) {
-    // Another process's candidate won; clean up and bail.
-    await rm(tmpPath).catch(pollLog.swallow("debug", "rm polling candidate tmp failed", { tmpPath }));
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+    await rm(candidatePath, { recursive: true, force: true });
     throw error;
   }
 
-  try {
-    const { rename: nodeRename } = await import("node:fs/promises");
-    await nodeRename(tmpPath, ownerPath);
-  } catch {
-    // rename failed (e.g. cross-device or another process already wrote owner.json).
-    await rm(tmpPath).catch(pollLog.swallow("debug", "rm polling candidate tmp after rename failure", { tmpPath }));
+  // Atomically quarantine a stale lock. The owner-derived tombstone path keeps
+  // concurrent stale-lock breakers from deleting a newly acquired lock.
+  if (!await quarantineStalePollingLock(lockPath)) {
+    await rm(candidatePath, { recursive: true, force: true });
     return undefined;
   }
 
+  try {
+    await rename(candidatePath, lockPath);
+  } catch (error) {
+    await rm(candidatePath, { recursive: true, force: true }).catch(pollLog.swallow("debug", "remove polling lock candidate failed", { candidatePath }));
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST" || code === "ENOTEMPTY") return undefined;
+    throw error;
+  }
+
+  // Sweep any race-created artifacts now that we own the live lock path.
+  await cleanupPollingLockArtifacts(lockPath);
+
+  const heartbeatPath = join(lockPath, heartbeatName);
   const touch = setInterval(() => {
-    void (async () => {
-      const current = await readPollingLockOwner(ownerPath);
-      if (current?.id !== owner.id) return;
-      owner.touchedAt = new Date().toISOString();
-      await writeFile(ownerPath, ownerText(owner), { mode: 0o600 }).catch(pollLog.swallow("warn", "polling lock touch write failed", { ownerPath }));
-    })();
+    owner.touchedAt = new Date().toISOString();
+    void writeFile(heartbeatPath, owner.touchedAt, { mode: 0o600 })
+      .catch(pollLog.swallow("warn", "polling lock heartbeat write failed", { heartbeatPath }));
   }, POLL_LOCK_TOUCH_MS);
 
   return {
     owns: async () => (await readPollingLockOwner(ownerPath))?.id === owner.id,
     release: async () => {
       clearInterval(touch);
-      const current = await readPollingLockOwner(ownerPath);
-      if (current?.id === owner.id) await rm(lockPath, { recursive: true, force: true }).catch(pollLog.swallow("debug", "rm polling lock on release failed", { lockPath }));
+      const retiredPath = `${lockPath}.retired-${owner.id}`;
+      try {
+        await rename(lockPath, retiredPath);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "EEXIST" || code === "ENOTEMPTY") return;
+        pollLog.warn("retire polling lock on release failed", { lockPath, error });
+        return;
+      }
+      // Tombstone only exists to free the live path safely; delete immediately.
+      await removeLockArtifact(retiredPath, "remove retired polling lock on release failed");
+      await cleanupPollingLockArtifacts(lockPath);
     },
   };
 }
@@ -153,6 +213,8 @@ export type TelegramUpdateBatchDeps = {
   getConfig: () => TelegramConfig;
   setConfig: (config: TelegramConfig) => void;
   persistConfig: (config: TelegramConfig) => Promise<void>;
+  persistUpdate?: (config: TelegramConfig, update: TelegramUpdate) => Promise<void>;
+  shouldProcess?: () => boolean;
   handleUpdate: (update: TelegramUpdate) => Promise<void>;
   onError: (error: unknown) => void;
 };
@@ -169,17 +231,20 @@ export async function processTelegramUpdatesBatch(
   deps: TelegramUpdateBatchDeps,
   signal?: AbortSignal,
 ): Promise<void> {
+  const batchToken = deps.getConfig().botToken;
   for (const update of updates) {
-    if (signal?.aborted) return;
+    if (signal?.aborted || (deps.shouldProcess && !deps.shouldProcess())) return;
     try {
       await deps.handleUpdate(update);
     } catch (error) {
       deps.onError(error);
       return;
     }
+    if (deps.getConfig().botToken !== batchToken) return;
     const nextConfig = { ...deps.getConfig(), lastUpdateId: update.update_id };
     try {
-      await deps.persistConfig(nextConfig);
+      if (deps.persistUpdate) await deps.persistUpdate(nextConfig, update);
+      else await deps.persistConfig(nextConfig);
       deps.setConfig(nextConfig);
     } catch (error) {
       deps.onError(error);
@@ -191,8 +256,10 @@ export async function processTelegramUpdatesBatch(
 export function createTelegramPollingRuntime(deps: TelegramUpdateBatchDeps & {
   reloadConfig?: () => Promise<void>;
   onSuccess?: () => void;
+  shouldPoll?: () => boolean;
 }): TelegramPollingRuntime {
   let abort: AbortController | undefined;
+  let loopPromise: Promise<void> | undefined;
   let pollLock: { token: string; owns: () => Promise<boolean>; release: () => Promise<void> } | undefined;
 
   const releasePollLock = async () => {
@@ -217,58 +284,74 @@ export function createTelegramPollingRuntime(deps: TelegramUpdateBatchDeps & {
   const loop = async (signal: AbortSignal) => {
     let backoffMs = MIN_BACKOFF_MS;
 
-    while (!signal.aborted) {
-      const token = deps.getConfig().botToken;
-      if (!token) {
-        await releasePollLock();
-        await sleep(MIN_BACKOFF_MS, signal);
-        continue;
-      }
-      if (!(await ensurePollLock(token))) {
-        deps.onError(new Error("Telegram polling skipped: another local pi instance is already polling this bot token."));
-        await sleep(MAX_BACKOFF_MS, signal);
-        continue;
-      }
+    try {
+      while (!signal.aborted) {
+        if (deps.shouldPoll && !deps.shouldPoll()) {
+          await releasePollLock();
+          await sleep(MIN_BACKOFF_MS, signal);
+          continue;
+        }
+        const token = deps.getConfig().botToken;
+        if (!token) {
+          await releasePollLock();
+          await sleep(MIN_BACKOFF_MS, signal);
+          continue;
+        }
+        if (!(await ensurePollLock(token))) {
+          deps.onError(new Error("Telegram polling skipped: another local pi instance is already polling this bot token."));
+          await sleep(MAX_BACKOFF_MS, signal);
+          continue;
+        }
 
-      try {
-        // Refresh config after owning the poll lock. A process that waited for
-        // the lock may have stale in-memory lastUpdateId; re-reading prevents it
-        // from polling an already-persisted update after another process/reload.
-        await deps.reloadConfig?.();
-        if (signal.aborted) return;
-        const refreshedToken = deps.getConfig().botToken;
-        if (!refreshedToken) continue;
-        if (refreshedToken !== token) continue;
+        try {
+          // Refresh config after owning the poll lock. A process that waited for
+          // the lock may have stale in-memory lastUpdateId; re-reading prevents it
+          // from polling an already-persisted update after another process/reload.
+          await deps.reloadConfig?.();
+          if (signal.aborted) return;
+          if (deps.shouldPoll && !deps.shouldPoll()) continue;
+          const refreshedToken = deps.getConfig().botToken;
+          if (!refreshedToken) continue;
+          if (refreshedToken !== token) continue;
 
-        const updates = await getTelegramUpdates(deps.getConfig(), signal);
-        backoffMs = MIN_BACKOFF_MS;
-        deps.onSuccess?.();
+          const updates = await getTelegramUpdates(deps.getConfig(), signal);
+          if (deps.getConfig().botToken !== refreshedToken) continue;
+          if (deps.shouldPoll && !deps.shouldPoll()) continue;
+          backoffMs = MIN_BACKOFF_MS;
+          deps.onSuccess?.();
 
-        await processTelegramUpdatesBatch(updates, deps, signal);
-      } catch (error) {
-        if (signal.aborted) return;
-        deps.onError(error);
-        await sleep(backoffMs, signal);
-        backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+          await processTelegramUpdatesBatch(updates, deps, signal);
+        } catch (error) {
+          if (signal.aborted) return;
+          deps.onError(error);
+          await sleep(backoffMs, signal);
+          backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+        }
       }
+    } finally {
+      await releasePollLock();
     }
-    await releasePollLock();
   };
 
   return {
     start() {
-      if (abort) return;
-      abort = new AbortController();
-      void loop(abort.signal).catch((error) => {
-        abort = undefined;
-        void releasePollLock();
-        deps.onError(error);
-      });
+      if (abort || (deps.shouldPoll && !deps.shouldPoll())) return;
+      const controller = new AbortController();
+      abort = controller;
+      loopPromise = loop(controller.signal)
+        .catch((error) => {
+          deps.onError(error);
+        })
+        .finally(() => {
+          if (abort === controller) abort = undefined;
+          loopPromise = undefined;
+        });
     },
     async stop() {
-      abort?.abort();
-      abort = undefined;
-      await releasePollLock();
+      const controller = abort;
+      controller?.abort();
+      await loopPromise;
+      if (abort === controller) abort = undefined;
     },
     isActive() {
       return !!abort;
