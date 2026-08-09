@@ -1,15 +1,21 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { extname, join, resolve } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createActiveTelegramTransport } from "./lib/active-transport.ts";
 import { registerTelegramAttachmentTool } from "./lib/attachments.ts";
-import { readResolvedTelegramConfig, writeResolvedTelegramConfig, getAgentDir } from "./lib/config.ts";
+import { enableConfiguredTelegramOnStartup, readResolvedTelegramConfig, writeResolvedTelegramConfig, getAgentDir } from "./lib/config.ts";
 import { createTelegramController, type TelegramCommandHandler } from "./lib/controller.ts";
+import { escapeHtml } from "./lib/html.ts";
 import { createHeartbeat } from "./lib/heartbeat.ts";
+import { replayTelegramHistory, type TelegramHistoryEntry } from "./lib/history-replay.ts";
+import { TelegramInstanceCoordinator, telegramTokenHash, type TelegramActiveInstance, type TelegramInstanceMetadata } from "./lib/instance-coordinator.ts";
 import { registerTelegramRenderer } from "./lib/renderer.ts";
 import { getActiveSession, installAgentSessionCapture } from "./lib/session-capture.ts";
 import { createTelegramTransport, downloadTelegramFile, getTelegramBotUsername, getTelegramFile } from "./lib/telegram-api.ts";
 import { createTelegramUiRuntime } from "./lib/telegram-ui.ts";
 import { formatTelegramStatusLine, clearTelegramStatus, TELEGRAM_STATUS_KEY } from "./lib/status.ts";
+import { installTelegramStatusAlignment } from "./lib/status-footer.ts";
 import { createTelegramPollingRuntime } from "./lib/polling.ts";
 import { initLogger, log, type LogLevel } from "./lib/logger.ts";
 import { authorizeTelegramUser, ensureTelegramPairingCode, formatPairingInstructions } from "./lib/pairing.ts";
@@ -24,6 +30,10 @@ const indexLog = log.child("index");
 
 type TelegramPlusRuntimeState = {
   dispose?: () => void;
+  instanceId?: string;
+  startedAt?: string;
+  handledReplayByToken?: Record<string, number>;
+  notifiedFailoverByToken?: Record<string, number>;
 };
 
 const TELEGRAM_PLUS_RUNTIME_STATE = Symbol.for("pi-telegram-plus.runtime-state");
@@ -31,11 +41,17 @@ const TELEGRAM_PLUS_RUNTIME_STATE = Symbol.for("pi-telegram-plus.runtime-state")
 function getTelegramPlusRuntimeState(): TelegramPlusRuntimeState {
   const g = globalThis as typeof globalThis & Record<symbol, TelegramPlusRuntimeState | undefined>;
   g[TELEGRAM_PLUS_RUNTIME_STATE] ??= {};
-  return g[TELEGRAM_PLUS_RUNTIME_STATE];
+  const state = g[TELEGRAM_PLUS_RUNTIME_STATE];
+  state.instanceId ??= randomUUID();
+  state.startedAt ??= new Date().toISOString();
+  state.handledReplayByToken ??= {};
+  state.notifiedFailoverByToken ??= {};
+  return state;
 }
 
 export default function piTelegramPlus(pi: ExtensionAPI): void {
   installAgentSessionCapture();
+  installTelegramStatusAlignment();
   // Initialize file logging first, before any subsystem can emit. Log directory
   // lives under the pi agent cache dir alongside tg.json; level is overridable
   // via PI_TELEGRAM_PLUS_LOG_LEVEL (debug/info/warn/error). See lib/logger.ts.
@@ -49,6 +65,13 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
 
   let config: TelegramConfig = {};
   let resolvedConfig: ResolvedTelegramConfig | undefined;
+  let coordinator: TelegramInstanceCoordinator | undefined;
+  let coordinatorTimer: ReturnType<typeof setInterval> | undefined;
+  let replayAbortController: AbortController | undefined;
+  const pendingHandoffs = new Set<string>();
+  let requestCoordinatorReconcile: () => void = () => undefined;
+  let replayReady: Promise<void> = Promise.resolve();
+  let releaseReplayGate: (() => void) | undefined;
   const activeTurnKey = (chatId: number, messageThreadId?: number) => `${chatId}:${messageThreadId ?? "main"}`;
   // Per chat/thread active turns: prevents interleaving in one Telegram target
   // while allowing different topics in the same supergroup to stay isolated.
@@ -56,9 +79,15 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
   let lastStatusError: string | undefined;
 
   const setConfig = (nextConfig: TelegramConfig) => {
+    const routingChanged = config.botToken !== nextConfig.botToken
+      || config.telegramEnabled !== nextConfig.telegramEnabled;
     config = nextConfig;
     if (resolvedConfig) resolvedConfig.config = nextConfig;
     refreshStatus();
+    if (routingChanged) {
+      replayAbortController?.abort();
+      requestCoordinatorReconcile();
+    }
   };
 
   const currentSessionCwd = (): string => {
@@ -98,9 +127,15 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
   };
 
   const switchResolvedConfig = (next: ResolvedTelegramConfig) => {
+    const routingChanged = config.botToken !== next.config.botToken
+      || config.telegramEnabled !== next.config.telegramEnabled;
     resolvedConfig = next;
     config = next.config;
     refreshStatus();
+    if (routingChanged) {
+      replayAbortController?.abort();
+      requestCoordinatorReconcile();
+    }
   };
 
   const isTelegramEnabled = (): boolean => {
@@ -109,7 +144,31 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     return resolvedConfig?.scope === "workspace";
   };
 
-  const transport = createTelegramTransport(() => config);
+  const rawTransport = createTelegramTransport(() => config);
+  const getActiveSendLease = (): string | undefined => {
+    const token = config.botToken;
+    const active = coordinator?.getActive();
+    if (!token
+      || !coordinator
+      || coordinator.tokenHash !== telegramTokenHash(token)
+      || !coordinator.isActive()
+      || pendingHandoffs.size > 0
+      || !active
+      || active.replay) {
+      return undefined;
+    }
+    return `${coordinator.tokenHash}:${active.generation}`;
+  };
+  const isActiveInstance = () => getActiveSendLease() !== undefined;
+  const activeBaseTransport = createTelegramTransport(() => config, {
+    getSendLease: getActiveSendLease,
+    shouldSend: (lease) => lease !== undefined && lease === getActiveSendLease(),
+  });
+  const transport = createActiveTelegramTransport(activeBaseTransport, {
+    isActive: isActiveInstance,
+    getLease: getActiveSendLease,
+    waitUntilReady: () => replayReady,
+  });
   const ui = createTelegramUiRuntime({
     getSession: getActiveSession,
     transport,
@@ -121,7 +180,9 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     getConfig: () => config,
     getActiveTurns: () => [...activeTurns.values()],
     sendChatAction: (chatId, action, messageThreadId) => transport.sendChatAction(chatId, action, messageThreadId),
-    ensurePollingStarted: () => { if (config.botToken && isTelegramEnabled() && !polling.isActive()) polling.start(); },
+    ensurePollingStarted: () => {
+      if (config.botToken && isTelegramEnabled() && isActiveInstance() && !polling.isActive()) polling.start();
+    },
   });
 
   const telegramCommands = new Map<string, TelegramCommandHandler>();
@@ -187,6 +248,7 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
   registerTelegramAttachmentTool(pi, {
     getActiveTurn: getCurrentActiveTurn,
     getDefaultChatId: () => activeTurns.size === 0 ? config.activeChatId : undefined,
+    isActive: isActiveInstance,
     transport,
   });
 
@@ -252,11 +314,45 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     getMessageMode: () => config.messageMode ?? "steer",
   });
 
+  const maxConfiguredUpdateId = (token: string): number | undefined => {
+    if (!resolvedConfig) return config.botToken === token ? config.lastUpdateId : undefined;
+    const configs = [
+      resolvedConfig.store.global,
+      ...(resolvedConfig.store.workspaces ?? []).map((workspace) => workspace.config),
+    ];
+    const offsets = configs
+      .filter((candidate) => candidate?.botToken === token && typeof candidate.lastUpdateId === "number")
+      .map((candidate) => candidate!.lastUpdateId!);
+    return offsets.length > 0 ? Math.max(...offsets) : undefined;
+  };
+
+  const refreshSharedCursor = async (candidate = coordinator): Promise<void> => {
+    const token = config.botToken;
+    if (!candidate || !token || candidate.tokenHash !== telegramTokenHash(token)) return;
+    const cursor = await candidate.syncCursor(maxConfiguredUpdateId(token));
+    if (cursor !== undefined && cursor !== config.lastUpdateId) {
+      config = { ...config, lastUpdateId: cursor };
+      if (resolvedConfig) resolvedConfig.config = config;
+    }
+  };
+
   const polling = createTelegramPollingRuntime({
     getConfig: () => config,
     setConfig,
     persistConfig: persistCurrentConfig,
-    reloadConfig: async () => switchResolvedConfig(await readResolvedTelegramConfig(currentSessionCwd())),
+    persistUpdate: async (nextConfig, update) => {
+      await persistCurrentConfig(nextConfig);
+      const currentCoordinator = coordinator;
+      if (currentCoordinator && nextConfig.botToken && currentCoordinator.tokenHash === telegramTokenHash(nextConfig.botToken)) {
+        await currentCoordinator.persistCursor(update.update_id);
+      }
+    },
+    reloadConfig: async () => {
+      switchResolvedConfig(await readResolvedTelegramConfig(currentSessionCwd()));
+      await refreshSharedCursor();
+    },
+    shouldPoll: isActiveInstance,
+    shouldProcess: isActiveInstance,
     handleUpdate: async (update) => {
       refreshStatus();
       if (update.callback_query) await controller.handleCallbackQuery(update.callback_query);
@@ -285,11 +381,295 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     },
   });
 
+  let replayInFlight: { tokenHash: string; generation: number } | undefined;
+  let reconcileTail: Promise<void> = Promise.resolve();
+
+  const openReplayGate = (): (() => void) => {
+    releaseReplayGate?.();
+    let resolveGate: () => void = () => undefined;
+    let released = false;
+    replayReady = new Promise<void>((resolveGatePromise) => {
+      resolveGate = resolveGatePromise;
+    });
+    const close = () => {
+      if (released) return;
+      released = true;
+      resolveGate();
+      if (releaseReplayGate === close) releaseReplayGate = undefined;
+    };
+    releaseReplayGate = close;
+    return close;
+  };
+
+  const buildInstanceHeartbeat = (): Omit<TelegramInstanceMetadata, "id" | "pid" | "startedAt" | "heartbeatAt"> => {
+    const session = getActiveSession();
+    const model = session?.model;
+    return {
+      cwd: currentSessionCwd(),
+      sessionId: session?.sessionId,
+      sessionName: session?.sessionName,
+      model: model ? `${model.provider}/${model.id}` : undefined,
+      busy: session ? !session.isIdle : false,
+    };
+  };
+
+  const startHistoryReplay = (
+    active: TelegramActiveInstance,
+    replayCoordinator: TelegramInstanceCoordinator,
+    metadata: ReturnType<typeof buildInstanceHeartbeat>,
+  ): void => {
+    if (!active.replay || replayInFlight) return;
+    const handledByToken = runtimeState.handledReplayByToken!;
+    if ((handledByToken[replayCoordinator.tokenHash] ?? 0) >= active.generation) return;
+    replayInFlight = { tokenHash: replayCoordinator.tokenHash, generation: active.generation };
+    const closeReplayGate = openReplayGate();
+    const replayController = new AbortController();
+    replayAbortController = replayController;
+    const replayConfig = { ...config };
+    const session = getActiveSession();
+    const entries = (session?.sessionManager.getBranch() ?? []) as TelegramHistoryEntry[];
+    const replayTarget = active.replay;
+    const canContinue = () => coordinator === replayCoordinator
+      && config.botToken === replayConfig.botToken
+      && !!config.botToken
+      && replayCoordinator.tokenHash === telegramTokenHash(config.botToken)
+      && isTelegramEnabled()
+      && replayCoordinator.isActive()
+      && replayCoordinator.getActive()?.generation === active.generation;
+    const replayLease = `${replayCoordinator.tokenHash}:${active.generation}`;
+    const replayTransport = createTelegramTransport(() => replayConfig, {
+      getAbortSignal: () => replayController.signal,
+      getSendLease: () => replayLease,
+      shouldSend: (lease) => lease === replayLease && canContinue(),
+    });
+
+    void (async () => {
+      let shouldCompleteReplay = false;
+      try {
+        const result = await replayTelegramHistory({
+          entries,
+          config: replayConfig,
+          transport: replayTransport,
+          target: replayTarget,
+          instance: {
+            cwd: metadata.cwd,
+            sessionId: metadata.sessionId,
+            sessionName: metadata.sessionName,
+            model: metadata.model,
+            instanceId: replayCoordinator.instanceId,
+          },
+          canContinue,
+        });
+        if (!result.aborted) {
+          handledByToken[replayCoordinator.tokenHash] = active.generation;
+          shouldCompleteReplay = true;
+        }
+      } catch (error) {
+        if ((error instanceof Error && error.name === "TelegramSendSuppressedError") || !canContinue()) {
+          indexLog.debug("Telegram history replay interrupted by instance switch or reload", { generation: active.generation });
+        } else {
+          handledByToken[replayCoordinator.tokenHash] = active.generation;
+          shouldCompleteReplay = true;
+          indexLog.warn("Telegram history replay failed", { generation: active.generation, error });
+          await replayTransport.sendText(
+            replayTarget.chatId,
+            `⚠️ <b>History replay failed.</b>\n${escapeHtml(error instanceof Error ? error.message : String(error))}`,
+            replayTarget.messageThreadId,
+          ).catch(indexLog.swallow("warn", "send history replay failure notice failed", { chatId: replayTarget.chatId }));
+        }
+      } finally {
+        if (shouldCompleteReplay) {
+          await replayCoordinator.completeReplay(active.generation).catch(indexLog.swallow("warn", "complete history replay state failed", { generation: active.generation }));
+        }
+        if (replayInFlight?.tokenHash === replayCoordinator.tokenHash
+          && replayInFlight.generation === active.generation) {
+          replayInFlight = undefined;
+        }
+        if (replayAbortController === replayController) replayAbortController = undefined;
+        closeReplayGate();
+        if (shouldCompleteReplay && coordinator === replayCoordinator && replayCoordinator.isActive() && isTelegramEnabled()) {
+          polling.start();
+        } else if (!shouldCompleteReplay && coordinator === replayCoordinator) {
+          requestCoordinatorReconcile();
+        }
+      }
+    })();
+  };
+
+  const reconcileCoordinator = async (): Promise<void> => {
+    if (disposed) return;
+    const token = config.botToken;
+    if (!token || !isTelegramEnabled()) {
+      replayAbortController?.abort();
+      coordinator = undefined;
+      await polling.stop();
+      refreshStatus();
+      return;
+    }
+
+    const tokenHash = telegramTokenHash(token);
+    if (!coordinator || coordinator.tokenHash !== tokenHash) {
+      replayAbortController?.abort();
+      coordinator = new TelegramInstanceCoordinator({
+        token,
+        instanceId: runtimeState.instanceId!,
+        startedAt: runtimeState.startedAt!,
+      });
+    }
+    const currentCoordinator = coordinator;
+    await refreshSharedCursor(currentCoordinator);
+    const metadata = buildInstanceHeartbeat();
+    const snapshot = await currentCoordinator.reconcile(metadata);
+    if (disposed || coordinator !== currentCoordinator || config.botToken !== token || !isTelegramEnabled()) return;
+    if (pendingHandoffs.size > 0) {
+      await polling.stop();
+      refreshStatus();
+      return;
+    }
+
+    if (!currentCoordinator.isActive()) {
+      replayAbortController?.abort();
+      await polling.stop();
+      refreshStatus();
+      return;
+    }
+
+    if (snapshot.active.reason === "failover") {
+      const notifiedByToken = runtimeState.notifiedFailoverByToken!;
+      if ((notifiedByToken[tokenHash] ?? 0) < snapshot.active.generation && config.activeChatId !== undefined) {
+        const chatId = config.activeChatId;
+        const previousGeneration = notifiedByToken[tokenHash] ?? 0;
+        notifiedByToken[tokenHash] = snapshot.active.generation;
+        void transport.sendText(
+          chatId,
+          `⚠️ <b>Telegram instance failover</b>\nThe previous active pi instance went offline. This instance is now active.`,
+        ).then((sent) => {
+          if (sent.length === 0 && notifiedByToken[tokenHash] === snapshot.active.generation) {
+            notifiedByToken[tokenHash] = previousGeneration;
+          }
+        }).catch((error) => {
+          if (notifiedByToken[tokenHash] === snapshot.active.generation) {
+            notifiedByToken[tokenHash] = previousGeneration;
+          }
+          indexLog.warn("send instance failover notice failed", { chatId, error });
+        });
+      }
+    }
+
+    if (snapshot.active.replay) {
+      const handled = runtimeState.handledReplayByToken![tokenHash] ?? 0;
+      if (handled < snapshot.active.generation) {
+        startHistoryReplay(snapshot.active, currentCoordinator, metadata);
+        refreshStatus();
+        return;
+      }
+      if (replayInFlight?.tokenHash === tokenHash && replayInFlight.generation === snapshot.active.generation) {
+        refreshStatus();
+        return;
+      }
+      await currentCoordinator.completeReplay(snapshot.active.generation);
+    }
+
+    if (!polling.isActive()) polling.start();
+    refreshStatus();
+  };
+
+  requestCoordinatorReconcile = () => {
+    reconcileTail = reconcileTail
+      .then(reconcileCoordinator)
+      .catch((error) => {
+        lastStatusError = error instanceof Error ? error.message : String(error);
+        indexLog.warn("Telegram instance reconciliation failed", { error });
+        refreshStatus(lastStatusError);
+      });
+  };
+
+  coordinatorTimer = setInterval(requestCoordinatorReconcile, 2_000);
+
+  const formatInstanceChoice = (instance: TelegramInstanceMetadata, activeId: string): string => {
+    const marker = instance.id === activeId ? "✓" : " ";
+    const project = (basename(instance.cwd) || instance.cwd).slice(0, 28);
+    const session = (instance.sessionName || instance.sessionId?.slice(0, 8) || "session").slice(0, 24);
+    const model = (instance.model || "no-model").slice(0, 36);
+    return `${marker} ${project} · ${session} · ${model} · ${instance.id.slice(0, 8)}`;
+  };
+
+  telegramCommands.set("tg-switch", async (args, ctx) => {
+    const currentCoordinator = coordinator;
+    if (!currentCoordinator || !currentCoordinator.isActive()) {
+      ctx.ui.notify("This pi instance is not the active Telegram instance.", "error");
+      return;
+    }
+    const instances = await currentCoordinator.listInstances();
+    const active = currentCoordinator.getActive();
+    if (!active || instances.length === 0) {
+      ctx.ui.notify("No live Telegram instances are available.", "error");
+      return;
+    }
+
+    let target: TelegramInstanceMetadata | undefined;
+    const query = args.trim();
+    if (!query) {
+      const choices = instances.map((instance) => formatInstanceChoice(instance, active.instanceId));
+      const selected = await ctx.ui.select("Switch Telegram pi instance", choices);
+      if (!selected) return;
+      target = instances[choices.indexOf(selected)];
+    } else if (query.toLowerCase() === "current") {
+      target = instances.find((instance) => instance.id === active.instanceId);
+    } else {
+      const matches = instances.filter((instance) => instance.id === query || instance.id.startsWith(query));
+      if (matches.length > 1) {
+        ctx.ui.notify(`Instance id is ambiguous: ${query}`, "error");
+        return;
+      }
+      target = matches[0];
+    }
+    if (!target) {
+      ctx.ui.notify(`Telegram instance not found: ${query || "selection"}`, "error");
+      return;
+    }
+
+    const turn = getCurrentTelegramTurn();
+    const chatId = turn?.chatId ?? config.activeChatId;
+    if (chatId === undefined) {
+      ctx.ui.notify("No active Telegram chat is available for history replay.", "error");
+      return;
+    }
+
+    const handoffId = randomUUID();
+    pendingHandoffs.add(handoffId);
+    try {
+      await polling.stop();
+      await currentCoordinator.switchTo(
+        target.id,
+        {
+          chatId,
+          messageThreadId: turn?.messageThreadId,
+          sourceMessageId: turn?.sourceMessageId,
+        },
+        { instanceId: active.instanceId, generation: active.generation },
+      );
+    } catch (error) {
+      throw error;
+    } finally {
+      pendingHandoffs.delete(handoffId);
+      requestCoordinatorReconcile();
+      if (pendingHandoffs.size === 0
+        && currentCoordinator.isActive()
+        && !currentCoordinator.getActive()?.replay) {
+        polling.start();
+      }
+    }
+  });
+
   function buildStatusState(error?: string): Parameters<typeof formatTelegramStatusLine>[1] {
+    const enabled = !!config.botToken && isTelegramEnabled();
     return {
       hasBotToken: !!config.botToken,
       pollingActive: polling.isActive(),
       paired: config.allowedUserId !== undefined,
+      connected: enabled && coordinator?.getActive() !== undefined,
+      current: enabled && (coordinator?.isActive() ?? false),
       processing: activeTurns.size > 0,
       error,
       botUsername: config.botUsername,
@@ -313,7 +693,18 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
     if (ctx?.ui?.setStatus) clearTelegramStatus(ctx);
   }
 
+  let disposed = false;
   function disposeRuntime(): void {
+    if (disposed) return;
+    disposed = true;
+    if (coordinatorTimer) clearInterval(coordinatorTimer);
+    coordinatorTimer = undefined;
+    requestCoordinatorReconcile = () => undefined;
+    pendingHandoffs.clear();
+    coordinator = undefined;
+    replayAbortController?.abort();
+    replayAbortController = undefined;
+    releaseReplayGate?.();
     void polling.stop();
     heartbeat.dispose();
     activeTurns.clear();
@@ -332,6 +723,11 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
         `Telegram config is not v2 yet. Run /tg-global-setup to recreate it. ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
+    }
+    const startupConfig = enableConfiguredTelegramOnStartup(config);
+    if (startupConfig !== config) {
+      config = startupConfig;
+      await persistCurrentConfig(config);
     }
     if (config.botToken && !config.botUsername) {
       try {
@@ -352,7 +748,7 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
         getActiveSession()?.extensionRunner.getUIContext().notify(formatPairingInstructions(config), "warning");
       }
     }
-    if (config.botToken && isTelegramEnabled() && !polling.isActive()) polling.start();
+    requestCoordinatorReconcile();
     try { await syncTelegramCommands(config.botToken, pi); } catch (err) { indexLog.debug("syncTelegramCommands on startup failed (non-critical)", { err }); }
     lastStatusError = undefined;
     heartbeat.startStatusHeartbeat(refreshStatus);

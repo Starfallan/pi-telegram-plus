@@ -15,6 +15,8 @@ export function formatTelegramStatusLine(
     hasBotToken: boolean;
     pollingActive: boolean;
     paired: boolean;
+    connected?: boolean;
+    current?: boolean;
     processing?: boolean;
     error?: string;
     botUsername?: string;
@@ -27,7 +29,7 @@ export function formatTelegramStatusLine(
   if (!state.hasBotToken) {
     return `${label} ${theme.fg("muted", "not configured")}`;
   }
-  if (!state.pollingActive) {
+  if (!state.pollingActive && !state.connected) {
     return `${label} ${theme.fg("muted", "disconnected")}`;
   }
   if (!state.paired) {
@@ -35,7 +37,11 @@ export function formatTelegramStatusLine(
   }
   const bot = state.botUsername ? ` @${state.botUsername}` : "";
   if (state.processing) {
-    return `${label} ${theme.fg("warning", "active")}${bot}`;
+    const active = state.current ? "active(current)" : "active";
+    return `${label} ${theme.fg("warning", active)}${bot}`;
+  }
+  if (state.current) {
+    return `${label} ${theme.fg("success", "connected(current)")}${bot}`;
   }
   return `${label} ${theme.fg("success", "connected")}${bot}`;
 }

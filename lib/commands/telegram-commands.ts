@@ -30,6 +30,7 @@ async function globalConnectAndStart(
   token: string,
   botUsername: string | undefined,
 ): Promise<void> {
+  await deps.getPolling().stop();
   const config = ensureTelegramPairingCode({ ...deps.getConfig(), botToken: token, botUsername, telegramEnabled: true });
   deps.setConfig(config);
   await writeGlobalTelegramConfig(config);
