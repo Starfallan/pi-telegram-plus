@@ -1,10 +1,14 @@
 /**
- * Bridge for pi-goal's `custom()` dialogs to Telegram inline buttons.
+ * Bridge for `custom()` dialogs to Telegram inline buttons.
  *
- * Layer B of the Telegram interaction plan: pi-goal's `ctx.ui.custom(factory)`
- * instantiates a opaque TUI component. We instantiate the factory with a minimal
+ * Layer B of the Telegram interaction plan: an extension's `ctx.ui.custom(factory)`
+ * instantiates an opaque TUI component. We instantiate the factory with a minimal
  * tui shim, render it to text, detect the dialog shape by its rendered output,
  * and drive Telegram inline buttons accordingly.
+ *
+ * Known shapes: pi-goal (confirmation / single-question / multi-question) and
+ * @gotgenes/pi-permission-system (permission-prompt). Unknown shapes degrade
+ * to a cancelled structured result so the agent continues gracefully.
  *
  * Safety invariant (non-negotiable): any detection failure or transport error
  * returns a cancelled structured result ({ questions: [], answers: [],
@@ -46,7 +50,7 @@ const CONTINUE_ANSWER = "Continue chatting — keep refining";
 
 const MAX_BUTTON_TEXT = 60;
 
-type DialogShape = "confirmation" | "single-question" | "multi-question" | "unknown";
+type DialogShape = "confirmation" | "single-question" | "multi-question" | "permission-prompt" | "unknown";
 
 /** Minimal tui shim satisfying what pi-goal's Editor needs: requestRender + terminal.rows. */
 function buildTuiShim(): { requestRender(): void; terminal: { rows: number } } {
@@ -64,6 +68,12 @@ function detectShape(text: string): DialogShape {
   if (text.includes("✓ Submit")) return "multi-question";
   // Confirmation dialog: known header + known trailing options.
   if (/Confirm (Sisyphus )?Goal Draft/.test(text) && text.includes(CONFIRM_ANSWER)) return "confirmation";
+  // Permission prompt: four fixed hotkey options (y) Yes / (s) Yes, for this
+  // session / (n) No / (r) No, provide reason — see @gotgenes/pi-permission-system
+  // PermissionPromptComponent.renderDecision (OPTION_ORDER = [y, s, n, r]).
+  // The selected row carries a ▶ marker followed by a space; unselected rows
+  // carry a single leading space in its place.
+  if (/^\s*(?:▶ )?\(y\) Yes$/m.test(text) && /^\s*(?:▶ )?\(r\) No, provide reason$/m.test(text)) return "permission-prompt";
   // Single-question: has numbered option lines or a free-text prompt.
   if (/^\s*[>]?\s*\d+\.\s+/m.test(text) || text.includes("Press Enter to write your answer")) return "single-question";
   return "unknown";
@@ -111,6 +121,56 @@ function extractOptions(lines: string[]): string[] {
 
 function hasCustomOption(lines: string[]): boolean {
   return lines.some((l) => l.includes("Write your own answer..."));
+}
+
+// ---- Permission prompt support (@gotgenes/pi-permission-system) ----
+// The inline permission dialog renders four hotkey options with fixed labels
+// and an optional per-request "for this session" label override:
+//
+//   <title>
+//   ...ask evidence lines...
+//
+//   ▶ (y) Yes
+//    (s) Yes, for this session
+//    (n) No
+//    (r) No, provide reason
+//
+//   <hint>
+//
+// A forwarded ask that picks the session option may enter a second step asking
+// whether the grant covers the subagent only or the whole serving session.
+
+/** Extract the title (first non-empty line above the ask evidence) of a permission prompt. */
+function extractPermissionTitle(lines: string[]): string {
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "" || /^─+$/.test(trimmed)) continue;
+    return trimmed;
+  }
+  return "Permission required";
+}
+
+/** Extract the ask evidence lines between the title and the first option row. */
+function extractPermissionAsk(lines: string[]): string[] {
+  const ask: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^\s*(?:▶ )?\([ysnr]\) /.test(trimmed)) break;
+    if (trimmed === "") continue;
+    if (/^─+$/.test(trimmed)) continue;
+    ask.push(trimmed);
+  }
+  // Drop the title (first line) — it is rendered separately for the Telegram message.
+  return ask.slice(1);
+}
+
+/** Extract the session option label (may be overridden from "Yes, for this session"). */
+function extractPermissionSessionLabel(lines: string[]): string {
+  for (const line of lines) {
+    const m = line.match(/^\s*(?:▶ )?\(s\) (.+)$/);
+    if (m) return m[1].trim();
+  }
+  return "Yes, for this session";
 }
 
 // ---- Multi-question questionnaire support ----
@@ -660,6 +720,111 @@ export async function bridgeCustomDialog<T>(deps: BridgeCustomDialogDeps): Promi
       // Unknown value → cancel
       return cancel();
     }
+  }
+
+  // ---- Permission prompt (@gotgenes/pi-permission-system) ----
+  // Four fixed buttons: Yes / Yes (session) / No / No+reason. The "No, provide
+  // reason" branch opens a free-text input; a forwarded session grant may then
+  // ask whether it applies to the subagent only or the whole serving session.
+  if (shape === "permission-prompt") {
+    const title = extractPermissionTitle(lines);
+    const ask = extractPermissionAsk(lines);
+    const sessionLabel = extractPermissionSessionLabel(lines);
+    const removeKeyboard = deps.removeKeyboard ?? (async () => {});
+    const cancel = (): T => { void removeKeyboard(); return CANCELLED_RESULT<T>(); };
+
+    const askBlock = ask.length > 0 ? `\n\n<pre>${escapeHtml(ask.join("\n"))}</pre>` : "";
+    const displayText = `<b>🔒 ${escapeHtml(title)}</b>${askBlock}`;
+
+    try {
+      await deps.sendButtons(displayText, [[
+        { text: "✅ Yes", value: "y" },
+        { text: `✅ ${truncateLabel(sessionLabel)}`, value: "s" },
+        { text: "❌ No", value: "n" },
+        { text: "💬 No, provide reason", value: "r" },
+      ]]);
+    } catch {
+      deps.notify("⚠️ Failed to send dialog buttons; the agent will continue.", "warning");
+      return cancel();
+    }
+
+    let value: string | boolean | undefined;
+    try {
+      value = await deps.waitInput(false, false);
+    } catch {
+      deps.notify("⚠️ Dialog input failed; the agent will continue.", "warning");
+      return cancel();
+    }
+
+    if (value === undefined) return cancel();
+    if (typeof value !== "string") return cancel();
+    if (value === "n") { void removeKeyboard(); return { approved: false, state: "denied" } as T; }
+    if (value === "y") { void removeKeyboard(); return { approved: true, state: "approved" } as T; }
+    if (value === "s") {
+      // A forwarded ask may require a scope choice (subagent only vs whole session).
+      // Detect by re-rendering: the component advances to the scope step after the
+      // session option is picked. If no scope step exists, resolve directly.
+      let scopeLines: string[] = [];
+      try {
+        if (typeof component.handleInput === "function") {
+          component.handleInput("s");
+          scopeLines = stripAnsi(component.render(width).join("\n")).split("\n");
+        }
+      } catch {
+        // If driving the component fails, fall back to a plain session approval.
+      }
+      const isScopeStep = scopeLines.some((l) => l.includes("Apply this session grant to:"));
+      if (!isScopeStep) { void removeKeyboard(); return { approved: true, state: "approved_for_session" } as T; }
+
+      // Scope step: offer the two labels as buttons.
+      const subagentLabel = scopeLines.find((l) => /This subagent only/.test(l)) ? "This subagent only" : "This subagent only";
+      const servingLabel = scopeLines.find((l) => /whole session|serving session/i.test(l)) ? "The whole session" : "The whole session";
+      try {
+        await deps.sendButtons(`${displayText}\n\n<b>${escapeHtml("Apply this session grant to:")}</b>`, [[
+          { text: truncateLabel(subagentLabel), value: "scope:subagent" },
+          { text: truncateLabel(servingLabel), value: "scope:serving" },
+          { text: "Cancel", value: "cancel" },
+        ]]);
+      } catch {
+        deps.notify("⚠️ Failed to send dialog buttons; the agent will continue.", "warning");
+        return cancel();
+      }
+      let scopeValue: string | boolean | undefined;
+      try {
+        scopeValue = await deps.waitInput(false, false);
+      } catch {
+        return cancel();
+      }
+      if (scopeValue === "scope:serving") { void removeKeyboard(); return { approved: true, state: "approved_for_serving_session" } as T; }
+      if (scopeValue === "scope:subagent") { void removeKeyboard(); return { approved: true, state: "approved_for_session" } as T; }
+      return cancel();
+    }
+    if (value === "r") {
+      // Free-text reason input. Empty/Cancel → plain denial.
+      try {
+        await deps.sendButtons(`${displayText}\n\nShare why this request was denied (optional):`, [[
+          { text: "Cancel", value: "cancel" },
+        ]]);
+      } catch {
+        deps.notify("⚠️ Failed to send dialog buttons; the agent will continue.", "warning");
+        return cancel();
+      }
+      let reason: string | boolean | undefined;
+      try {
+        reason = await deps.waitInput(true, false);
+      } catch {
+        return cancel();
+      }
+      if (reason === undefined || reason === "cancel") { void removeKeyboard(); return { approved: false, state: "denied" } as T; }
+      if (typeof reason === "string" && reason.trim()) {
+        void removeKeyboard();
+        return { approved: false, state: "denied_with_reason", denialReason: reason.trim() } as T;
+      }
+      void removeKeyboard();
+      return { approved: false, state: "denied" } as T;
+    }
+    // Unknown value → cancel.
+    return cancel();
   }
 
   // ---- Unknown component → safe fallback ----

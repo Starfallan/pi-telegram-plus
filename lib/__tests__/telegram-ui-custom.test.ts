@@ -419,6 +419,214 @@ describe("bridgeCustomDialog — multi-question driving", () => {
   });
 });
 
+// ---- bridgeCustomDialog: permission prompt (@gotgenes/pi-permission-system) ----
+
+const PERMISSION_RENDER = [
+  "Allow tool 'bash' for command 'rm -rf /tmp/x' matching 'rm *'?",
+  "",
+  "▶ (y) Yes",
+  " (s) Yes, for this session",
+  " (n) No",
+  " (r) No, provide reason",
+  "",
+  " y/s/n/r select • enter confirm • esc cancel",
+];
+
+// A realistic multi-field permission prompt (external_directory bash gate):
+// evidence lines are "key : value" pairs with a long, wrapped command.
+const PERMISSION_RENDER_FULL = [
+  "Permission Required",
+  "tool              : bash",
+  "surface           : external_directory",
+  "rule              : *",
+  "command           : cd /repo && rm -rf node_modules && npm install",
+  "working directory : /home/user/project",
+  "external path     : /home/user/secrets",
+  "",
+  "▶ (y) Yes",
+  " (s) Yes, for this session",
+  " (n) No",
+  " (r) No, provide reason",
+  "",
+  " y/s/n/r select • enter confirm • esc cancel",
+];
+
+describe("bridgeCustomDialog — permission prompt formatting", () => {
+  it("wraps evidence in <pre> for monospace alignment and prefixes title with 🔒", async () => {
+    const { deps, resolveWaitInput, sentButtons } = makeDeps(stubFactory(PERMISSION_RENDER_FULL));
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("y");
+    await resultP;
+
+    const text = sentButtons[0].text;
+    // Title is bold with lock icon.
+    expect(text).toContain("<b>🔒 Permission Required</b>");
+    // Evidence is wrapped in <pre> (monospace, preserves alignment, not bold).
+    expect(text).toContain("<pre>");
+    expect(text).toContain("</pre>");
+    // The key:value pairs survive inside <pre> (alignment characters retained).
+    expect(text).toContain("surface           : external_directory");
+    // HTML-special chars in evidence are escaped so they can't break parsing.
+    expect(text).not.toMatch(/<pre>[^<]*<(?!\/pre>)/);
+  });
+});
+
+describe("bridgeCustomDialog — permission prompt", () => {
+  it("Yes button → { approved: true, state: 'approved' }", async () => {
+    const { deps, resolveWaitInput, sentButtons } = makeDeps(stubFactory(PERMISSION_RENDER));
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("y");
+    const result = await resultP;
+
+    expect(result).toBeDefined();
+    expect((result as any).approved).toBe(true);
+    expect((result as any).state).toBe("approved");
+
+    expect(sentButtons).toHaveLength(1);
+    expect(sentButtons[0].rows[0]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: "✅ Yes", value: "y" }),
+        expect.objectContaining({ text: "❌ No", value: "n" }),
+        expect.objectContaining({ text: "💬 No, provide reason", value: "r" }),
+      ]),
+    );
+  });
+
+  it("No button → { approved: false, state: 'denied' }", async () => {
+    const { deps, resolveWaitInput } = makeDeps(stubFactory(PERMISSION_RENDER));
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("n");
+    const result = await resultP;
+
+    expect(result).toBeDefined();
+    expect((result as any).approved).toBe(false);
+    expect((result as any).state).toBe("denied");
+    expect((result as any).denialReason).toBeUndefined();
+  });
+
+  it("Session button (no scope step) → { approved: true, state: 'approved_for_session' }", async () => {
+    // Component that does NOT advance to a scope step after 's' (direct, non-forwarded ask).
+    const factory = (_tui: unknown, _theme: unknown, _kb: unknown, _done: (result: unknown) => void) => ({
+      render: () => PERMISSION_RENDER,
+      handleInput: () => {},
+    });
+    const { deps, resolveWaitInput, sentButtons } = makeDeps(factory);
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("s");
+    const result = await resultP;
+
+    expect(result).toBeDefined();
+    expect((result as any).approved).toBe(true);
+    expect((result as any).state).toBe("approved_for_session");
+    // Only one sendButtons call (no scope step prompt).
+    expect(sentButtons).toHaveLength(1);
+  });
+
+  it("Session button + scope step → serving session choice", async () => {
+    // A forwarded ask: after 's' the component advances to the scope step.
+    let step = "decision";
+    const factory = (_tui: unknown, _theme: unknown, _kb: unknown, _done: (result: unknown) => void) => ({
+      render: () => (step === "decision" ? PERMISSION_RENDER : [
+        "Apply this session grant to:",
+        "",
+        "▶ This subagent only",
+        " The whole session",
+        "",
+        " ↑/↓ move • enter confirm • esc back",
+      ]),
+      handleInput: () => { step = "scope"; },
+    });
+    const waitInputs: Array<(v: string | boolean | undefined) => void> = [];
+    const sentButtons: { text: string; rows: ButtonRow[] }[] = [];
+    const deps = {
+      factory: factory as any,
+      theme: {},
+      width: 80,
+      sendButtons: async (text: string, rows: ButtonRow[]) => { sentButtons.push({ text, rows }); return { message_id: 100 }; },
+      waitInput: () => new Promise<string | boolean | undefined>((r) => { waitInputs.push(r); }),
+      notify: vi.fn(),
+    } as Parameters<typeof bridgeCustomDialog>[0];
+
+    const resultP = bridgeCustomDialog(deps);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(waitInputs).toHaveLength(1);
+    waitInputs[0]!("s");
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(waitInputs).toHaveLength(2);
+    expect(sentButtons[1].text).toContain("Apply this session grant to:");
+    waitInputs[1]!("scope:serving");
+
+    const result = await resultP;
+    expect(result).toBeDefined();
+    expect((result as any).approved).toBe(true);
+    expect((result as any).state).toBe("approved_for_serving_session");
+  });
+
+  it("No+reason with text → { approved: false, state: 'denied_with_reason', denialReason }", async () => {
+    const waitInputs: Array<(v: string | boolean | undefined) => void> = [];
+    const sentButtons: { text: string; rows: ButtonRow[] }[] = [];
+    const deps = {
+      factory: stubFactory(PERMISSION_RENDER) as any,
+      theme: {},
+      width: 80,
+      sendButtons: async (text: string, rows: ButtonRow[]) => { sentButtons.push({ text, rows }); return { message_id: 100 }; },
+      waitInput: () => new Promise<string | boolean | undefined>((r) => { waitInputs.push(r); }),
+      notify: vi.fn(),
+    } as Parameters<typeof bridgeCustomDialog>[0];
+
+    const resultP = bridgeCustomDialog(deps);
+    await new Promise((r) => setTimeout(r, 10));
+    waitInputs[0]!("r");
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sentButtons[1].text).toContain("why this request was denied");
+    waitInputs[1]!("Too dangerous in prod");
+
+    const result = await resultP;
+    expect(result).toBeDefined();
+    expect((result as any).approved).toBe(false);
+    expect((result as any).state).toBe("denied_with_reason");
+    expect((result as any).denialReason).toBe("Too dangerous in prod");
+  });
+
+  it("No+reason cancelled (undefined) → plain denial", async () => {
+    const waitInputs: Array<(v: string | boolean | undefined) => void> = [];
+    const deps = {
+      factory: stubFactory(PERMISSION_RENDER) as any,
+      theme: {},
+      width: 80,
+      sendButtons: async () => { return { message_id: 100 }; },
+      waitInput: () => new Promise<string | boolean | undefined>((r) => { waitInputs.push(r); }),
+      notify: vi.fn(),
+    } as Parameters<typeof bridgeCustomDialog>[0];
+
+    const resultP = bridgeCustomDialog(deps);
+    await new Promise((r) => setTimeout(r, 10));
+    waitInputs[0]!("r");
+    await new Promise((r) => setTimeout(r, 10));
+    waitInputs[1]!(undefined);
+
+    const result = await resultP;
+    expect(result).toBeDefined();
+    expect((result as any).approved).toBe(false);
+    expect((result as any).state).toBe("denied");
+    expect((result as any).denialReason).toBeUndefined();
+  });
+
+  it("timeout/undefined → cancelled", async () => {
+    const { deps, resolveWaitInput } = makeDeps(stubFactory(PERMISSION_RENDER));
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput(undefined);
+    const result = await resultP;
+
+    expect(result).toBeDefined();
+    // Permission prompt has no 'cancelled' field; a timeout returns the cancelled
+    // structured fallback (CANCELLED_RESULT), which carries cancelled:true.
+    expect((result as any).cancelled).toBe(true);
+  });
+});
+
 // ---- bridgeCustomDialog: unknown component ----
 
 const UNKNOWN_RENDER = [
