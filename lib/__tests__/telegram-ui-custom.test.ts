@@ -627,6 +627,43 @@ describe("bridgeCustomDialog — permission prompt", () => {
   });
 });
 
+// ---- bridgeCustomDialog: ask_user_question overlay fallback ----
+
+describe("bridgeCustomDialog — ask_user_question overlay returns undefined", () => {
+  it("overlay:true + onHandle → undefined (triggers RPC fallback)", async () => {
+    const { deps } = makeDeps(stubFactory(PERMISSION_RENDER), {
+      options: { overlay: true, onHandle: () => {}, overlayOptions: {} },
+    } as any);
+    const result = await bridgeCustomDialog(deps);
+    expect(result).toBeUndefined();
+  });
+
+  it("overlay:true WITHOUT onHandle (config-modal) → NOT undefined (permission-prompt still works)", async () => {
+    // config-modal passes overlay:true but no onHandle; it must not be diverted
+    // to undefined, since it has no RPC fallback.
+    const { deps, resolveWaitInput } = makeDeps(stubFactory(PERMISSION_RENDER), {
+      options: { overlay: true, overlayOptions: {} },
+    } as any);
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("y");
+    const result = await resultP;
+    expect(result).toBeDefined();
+    // Falls through to the permission-prompt branch (overlay:false in real life,
+    // but the guard keys on onHandle, not overlay alone).
+    expect((result as any).approved).toBe(true);
+    expect((result as any).state).toBe("approved");
+  });
+
+  it("no options → NOT undefined (pi-goal dialogs unaffected)", async () => {
+    const { deps, resolveWaitInput } = makeDeps(stubFactory(CONFIRM_RENDER));
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("confirm");
+    const result = await resultP;
+    expect(result).toBeDefined();
+    expect((result as any).cancelled).toBe(false);
+  });
+});
+
 // ---- bridgeCustomDialog: unknown component ----
 
 const UNKNOWN_RENDER = [

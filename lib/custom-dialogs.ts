@@ -34,6 +34,11 @@ export interface BridgeCustomDialogDeps {
   theme: unknown;
   /** Render width in columns (default 80). */
   width?: number;
+  /** The options object passed to `ctx.ui.custom(factory, options)`. Used to
+   * detect ask_user_question's overlay (overlay:true + onHandle), which has a
+   * native select/input RPC fallback that Telegram bridges better than the
+   * opaque custom component — returning undefined lets the caller fall back. */
+  options?: unknown;
   /** Send an inline-button message to Telegram. Button values are raw (un-encoded). */
   sendButtons: (text: string, rows: ButtonRow[]) => Promise<{ message_id: number }>;
   /** Wait for user input. Returns the raw callback value, typed text, or undefined (cancel/timeout). */
@@ -500,6 +505,20 @@ async function runMultiQuestionFlow(
  * interface compliance but is never resolved at runtime.
  */
 export async function bridgeCustomDialog<T>(deps: BridgeCustomDialogDeps): Promise<T | undefined> {
+  // ask_user_question passes { overlay: true, onHandle } — its component is a
+  // tabbed overlay the Telegram bridge cannot drive, but the extension has a
+  // native select/input RPC fallback (ask-user-question.ts → runRpcQuestionnaire)
+  // that tg-plus already bridges via select/input. Returning undefined lets
+  // ask_user_question fall back to that walker instead of receiving a
+  // cancelled result. config-modal also passes overlay:true but NO onHandle,
+  // so this guard is ask_user_question-specific and does not affect it.
+  if (deps.options && typeof deps.options === "object") {
+    const opts = deps.options as { overlay?: unknown; onHandle?: unknown };
+    if (opts.overlay === true && typeof opts.onHandle === "function") {
+      return undefined;
+    }
+  }
+
   const width = deps.width ?? 80;
   const tuiShim = buildTuiShim();
 

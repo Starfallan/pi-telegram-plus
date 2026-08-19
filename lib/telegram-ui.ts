@@ -187,6 +187,7 @@ export function createTelegramUiRuntime(deps: {
             factory,
             theme: base?.theme,
             width: 80,
+            options: _options,
             sendButtons: async (text, rows) => {
               const encodedRows = rows.map((row) => row.map((btn) => ({ text: btn.text, value: cb(flowId, btn.value) })));
               const sent = await sendOrReplaceButtons(chatId, messageThreadId, sourceMessageId, text, encodedRows, flowId);
