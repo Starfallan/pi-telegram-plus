@@ -452,7 +452,7 @@ const PERMISSION_RENDER_FULL = [
 ];
 
 describe("bridgeCustomDialog — permission prompt formatting", () => {
-  it("wraps evidence in <pre> for monospace alignment and prefixes title with 🔒", async () => {
+  it("title bold with 🔒, short facts inline, command in its own <pre>", async () => {
     const { deps, resolveWaitInput, sentButtons } = makeDeps(stubFactory(PERMISSION_RENDER_FULL));
     const resultP = bridgeCustomDialog(deps);
     resolveWaitInput("y");
@@ -461,13 +461,53 @@ describe("bridgeCustomDialog — permission prompt formatting", () => {
     const text = sentButtons[0].text;
     // Title is bold with lock icon.
     expect(text).toContain("<b>🔒 Permission Required</b>");
-    // Evidence is wrapped in <pre> (monospace, preserves alignment, not bold).
-    expect(text).toContain("<pre>");
-    expect(text).toContain("</pre>");
-    // The key:value pairs survive inside <pre> (alignment characters retained).
-    expect(text).toContain("surface           : external_directory");
-    // HTML-special chars in evidence are escaped so they can't break parsing.
-    expect(text).not.toMatch(/<pre>[^<]*<(?!\/pre>)/);
+    // Short facts render inline: label bold, value plain text.
+    expect(text).toContain("<b>tool</b>: bash");
+    expect(text).toContain("<b>surface</b>: external_directory");
+    expect(text).toContain("<b>rule</b>: *");
+    expect(text).toContain("<b>working directory</b>: /home/user/project");
+    expect(text).toContain("<b>external path</b>: /home/user/secrets");
+    // The command renders in its own <pre> block (label on its own line).
+    expect(text).toContain("<b>command</b>:\n<pre>cd /repo &amp;&amp; rm -rf node_modules &amp;&amp; npm install</pre>");
+  });
+
+  it("multi-line command + wrapped path: continuation lines stay in their fact", async () => {
+    // A real-world ask from the field: the command value spans several lines
+    // (no indentation survives Telegram/rendering) and the external path wraps
+    // with its label on its own line. Continuation lines must not become facts.
+    const realWorld = [
+      "Permission Required",
+      "tool              : bash",
+      "surface           : external_directory",
+      "rule              : *",
+      'command           : echo "===pi 实际加载的 tg-plus checkout 状态==="; cd',
+      '/Users/you/some-repo && echo "---HEAD---"; git log --oneline -3;',
+      'echo "---工作区状态---"; git status --short;',
+      'lib/custom-dialogs.ts | head; echo "done"',
+      "working directory : D:\\Code\\SomeRepo\\PiliNara",
+      "external path     :",
+      "c:\\users\\you\\.pi\\agent\\git\\github.com\\jalyfeng\\pi-telegram-plus",
+      "",
+      "▶ (y) Yes",
+      " (s) Yes, for this session",
+      " (n) No",
+      " (r) No, provide reason",
+      "",
+      " y/s/n/r select • enter confirm • esc cancel",
+    ];
+    const { deps, resolveWaitInput, sentButtons } = makeDeps(stubFactory(realWorld));
+    const resultP = bridgeCustomDialog(deps);
+    resolveWaitInput("y");
+    await resultP;
+
+    const text = sentButtons[0].text;
+    // Continuation lines were NOT parsed as new facts (no bogus <b>C</b>/<b>c</b>).
+    expect(text).not.toContain("<b>C</b>");
+    expect(text).not.toContain("<b>c</b>");
+    // The whole command stays inside ONE <pre> block with its newlines.
+    expect(text).toContain("<pre>echo \"===pi 实际加载的 tg-plus checkout 状态===\"; cd\n/Users/you/some-repo");
+    // The wrapped external path keeps its own label inline.
+    expect(text).toContain("<b>external path</b>: c:\\users\\you\\.pi\\agent");
   });
 });
 

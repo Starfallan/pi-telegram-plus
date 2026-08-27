@@ -169,6 +169,39 @@ function extractPermissionAsk(lines: string[]): string[] {
   return ask.slice(1);
 }
 
+/**
+ * Parse the permission facts rendered by @gotgenes/pi-permission-system's
+ * dialog-renderer `layout()`: one fact per line, `label : value` with labels
+ * right-padded to a column; a field whose value spans multiple lines continues
+ * on the following lines (indented in the TUI, but Telegram/render copies may
+ * drop the indent).
+ *
+ * A fact line is recognized by its label shape: letters/spaces only, followed
+ * by ` : ` — so a value continuation (a path like `C:/…`, `c:\…`, a quoted
+ * command snippet, or a bare continuation word) never matches and is appended
+ * to the previous fact's value. Windows drive prefixes (`C:`) do not match
+ * because they lack the trailing space before `:`, and quoted lines start
+ * with `"`.
+ */
+function parsePermissionFacts(ask: string[]): Array<{ label: string; value: string }> {
+  const facts: Array<{ label: string; value: string }> = [];
+  for (const line of ask) {
+    // Value may be empty (a wrapped path starts on the next line).
+    const m = /^([A-Za-z][A-Za-z ]{0,31}?)\s+:\s*(.*)$/.exec(line);
+    if (m) {
+      facts.push({ label: m[1].trim(), value: m[2] });
+      continue;
+    }
+    // Continuation line: append to the previous fact's value (a here-string, a
+    // multi-line command, or a path that wrapped).
+    if (facts.length > 0) {
+      const last = facts[facts.length - 1]!;
+      last.value = last.value ? `${last.value}\n${line.trim()}` : line.trim();
+    }
+  }
+  return facts;
+}
+
 /** Extract the session option label (may be overridden from "Yes, for this session"). */
 function extractPermissionSessionLabel(lines: string[]): string {
   for (const line of lines) {
@@ -176,6 +209,33 @@ function extractPermissionSessionLabel(lines: string[]): string {
     if (m) return m[1].trim();
   }
   return "Yes, for this session";
+}
+
+/**
+ * Render the parsed permission facts for Telegram as HTML.
+ *
+ * Layout choices (mobile-first): short facts render as one line each
+ * `<b>label</b>: value` (label bold, value plain text) so the eye separates
+ * fields; a long multi-line value (a full command) renders in its own `<pre>`
+ * block so word-wrapping on a narrow phone screen cannot tangle it with the
+ * following facts.
+ *
+ * Code-block heuristic: `command`/`runs` facts, or any value carrying a
+ * newline, always render in a `<pre>`; a long single-line value (a long path)
+ * stays inline — it wraps like the other fields, keeping the layout uniform.
+ */
+function renderPermissionFacts(facts: Array<{ label: string; value: string }>): string {
+  const parts: string[] = [];
+  for (const fact of facts) {
+    const isCode =
+      /^(?:command|runs)$/i.test(fact.label) || fact.value.includes("\n");
+    if (isCode) {
+      parts.push(`<b>${escapeHtml(fact.label)}</b>:\n<pre>${escapeHtml(fact.value)}</pre>`);
+    } else {
+      parts.push(`<b>${escapeHtml(fact.label)}</b>: ${escapeHtml(fact.value)}`);
+    }
+  }
+  return parts.join("\n");
 }
 
 // ---- Multi-question questionnaire support ----
@@ -752,8 +812,9 @@ export async function bridgeCustomDialog<T>(deps: BridgeCustomDialogDeps): Promi
     const removeKeyboard = deps.removeKeyboard ?? (async () => {});
     const cancel = (): T => { void removeKeyboard(); return CANCELLED_RESULT<T>(); };
 
-    const askBlock = ask.length > 0 ? `\n\n<pre>${escapeHtml(ask.join("\n"))}</pre>` : "";
-    const displayText = `<b>🔒 ${escapeHtml(title)}</b>${askBlock}`;
+    const body = renderPermissionFacts(parsePermissionFacts(ask));
+    const displayText =
+      `<b>🔒 ${escapeHtml(title)}</b>` + (body ? `\n\n${body}` : "");
 
     try {
       await deps.sendButtons(displayText, [[
