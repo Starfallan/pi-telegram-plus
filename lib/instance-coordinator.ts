@@ -89,6 +89,18 @@ function isErrno(error: unknown, code: string): boolean {
     return (error as NodeJS.ErrnoException)?.code === code;
 }
 
+/**
+ * True when a rename failure means "the destination is already occupied"
+ * rather than a missing source. POSIX reports EEXIST/ENOTEMPTY for
+ * rename(dir, existing_dir); Windows reports EPERM (MoveFileEx cannot
+ * replace a non-empty directory). A leftover lock from a crashed owner
+ * therefore surfaces as EPERM on Windows — without this the acquire loop
+ * throws instead of falling into the stale-owner recovery path.
+ */
+function isRenameBusyError(error: unknown): boolean {
+    return isErrno(error, "EEXIST") || isErrno(error, "ENOTEMPTY") || isErrno(error, "EPERM");
+}
+
 async function removeCoordinatorArtifact(path: string, reason: string): Promise<void> {
     await rm(path, { recursive: true, force: true }).catch(coordinatorLog.swallow("debug", reason, { path }));
 }
@@ -351,7 +363,7 @@ export class TelegramInstanceCoordinator {
                         await stageCandidate();
                         continue;
                     }
-                    if (!isErrno(error, "EEXIST") && !isErrno(error, "ENOTEMPTY")) throw error;
+                    if (!isRenameBusyError(error)) throw error;
                     const currentOwner = await this.readJson<CoordinatorLockOwner>(ownerPath);
                     const modifiedAt = await stat(this.lockPath).then((value) => value.mtimeMs).catch(() => this.now());
                     const stale = this.now() - modifiedAt > LOCK_STALE_MS
@@ -366,8 +378,7 @@ export class TelegramInstanceCoordinator {
                             continue;
                         } catch (renameError) {
                             if (!isErrno(renameError, "ENOENT")
-                                && !isErrno(renameError, "EEXIST")
-                                && !isErrno(renameError, "ENOTEMPTY")) {
+                                && !isRenameBusyError(renameError)) {
                                 throw renameError;
                             }
                         }

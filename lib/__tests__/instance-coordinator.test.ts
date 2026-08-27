@@ -144,6 +144,41 @@ describe("TelegramInstanceCoordinator", () => {
         expect(names.some((name) => name.startsWith("state.lock.stale-") || name.startsWith("state.lock.candidate-"))).toBe(false);
     });
 
+    it("recovers a dead-owner lock whose rename fails as EPERM (Windows)", async () => {
+        // Windows reports EPERM for rename(dir, existing_dir) where Linux/macOS
+        // report EEXIST/ENOTEMPTY. Simulate the Windows surface: pre-create the
+        // lock with a dead owner AND pre-create the candidate so the rename path
+        // is the busy-destination one (a dead-owner lock with no candidate would
+        // only exercise the ENOENT restage branch). The coordinator must treat
+        // the EPERM/busy rename as a held lock, detect the dead owner, and
+        // recover — not throw.
+        const currentNow = Date.now();
+        const coordinator = new TelegramInstanceCoordinator({
+            token: TOKEN,
+            instanceId: "instance-a",
+            startedAt: new Date(currentNow).toISOString(),
+            rootDir,
+            now: () => currentNow,
+            isPidAlive: (pid) => pid === process.pid,
+        });
+        const namespace = join(rootDir, "tg-runtime", telegramTokenHash(TOKEN));
+        const lockPath = join(namespace, "state.lock");
+        await mkdir(lockPath, { recursive: true });
+        await writeFile(join(lockPath, "owner.json"), JSON.stringify({
+            id: "dead-owner",
+            pid: 999_998,
+            createdAt: new Date(currentNow - 20_000).toISOString(),
+        }));
+        const staleTime = new Date(currentNow - 20_000);
+        await utimes(lockPath, staleTime, staleTime);
+
+        const snapshot = await coordinator.reconcile(heartbeat("/workspace/a"));
+
+        expect(snapshot.active.instanceId).toBe("instance-a");
+        const names = await readdir(namespace);
+        expect(names).not.toContain("state.lock");
+    });
+
     it("uses only the token hash in runtime paths and files", async () => {
         const coordinator = create("instance-a");
         await coordinator.reconcile(heartbeat("/workspace/a"));
