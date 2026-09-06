@@ -5,6 +5,8 @@ import { stripHtml, splitTelegramHtml } from "./text-split.ts";
 import { log } from "./logger.ts";
 
 const apiLog = log.child("telegram-api");
+const REQUEST_TIMEOUT_MS = 25_000;
+const FILE_REQUEST_TIMEOUT_MS = 60_000;
 
 type TelegramFileInfo = {
   file_id: string;
@@ -68,13 +70,18 @@ export async function telegramApi<T>(
 ): Promise<T> {
   let response: Response;
   try {
+    const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal,
+      signal: combinedSignal,
     });
   } catch (error) {
+    if ((error as Error)?.name === "AbortError" && !signal?.aborted) {
+      throw new Error("Telegram API request timed out");
+    }
     throw new Error(`Telegram API request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   const json = (await response.json()) as TelegramApiResponse & { result: T };
@@ -97,11 +104,16 @@ export async function downloadTelegramFile(token: string, filePath: string, sign
   const encodedPath = filePath.split("/").map((segment) => encodeURIComponent(segment)).join("/");
   let response: Response;
   try {
+    const timeoutSignal = AbortSignal.timeout(FILE_REQUEST_TIMEOUT_MS);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     response = await fetch(`https://api.telegram.org/file/bot${token}/${encodedPath}`, {
       method: "GET",
-      signal,
+      signal: combinedSignal,
     });
   } catch (error) {
+    if ((error as Error)?.name === "AbortError" && !signal?.aborted) {
+      throw new Error("Telegram file download timed out");
+    }
     throw new Error(`Telegram file download failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!response.ok) {
@@ -148,6 +160,8 @@ export function createTelegramTransport(
       } catch (error) {
         lastError = error;
         if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || requestSignal?.aborted) throw error;
+        // Don't retry on timeout: the request already failed because the network is unreachable.
+        if (error instanceof Error && error.message.includes("timed out")) throw error;
         const retryAfterMs = error instanceof TelegramApiRequestError ? error.retryAfterMs : undefined;
         // Prefer Telegram's explicit flood-control delay; otherwise use exponential backoff.
         await sleep(retryAfterMs ?? 250 * Math.pow(2, attempt));
@@ -355,10 +369,12 @@ export function createTelegramTransport(
           form.set("document", documentBlob, basename(path));
           try {
             ensureSendAllowed(lease);
+            const timeoutSignal = AbortSignal.timeout(FILE_REQUEST_TIMEOUT_MS);
+            const combinedSignal = sendSignal ? AbortSignal.any([sendSignal, timeoutSignal]) : timeoutSignal;
             const response = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
               method: "POST",
               body: form,
-              signal: sendSignal,
+              signal: combinedSignal,
             });
             const json = await response.json() as { ok: boolean; description?: string };
             if (!json.ok) throw new Error(json.description ?? "sendDocument failed");
@@ -369,7 +385,7 @@ export function createTelegramTransport(
           }
         } catch (error) {
           lastError = error;
-          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted) throw error;
+          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted || (error as any)?.name === "AbortError") throw error;
           await sleep(250 * Math.pow(2, attempt));
         }
       }
@@ -404,10 +420,12 @@ export function createTelegramTransport(
           }
           try {
             ensureSendAllowed(lease);
+            const timeoutSignal = AbortSignal.timeout(FILE_REQUEST_TIMEOUT_MS);
+            const combinedSignal = sendSignal ? AbortSignal.any([sendSignal, timeoutSignal]) : timeoutSignal;
             const response = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
               method: "POST",
               body: form,
-              signal: sendSignal,
+              signal: combinedSignal,
             });
             const json = await response.json() as { ok: boolean; description?: string };
             if (!json.ok) throw new Error(json.description ?? "sendPhoto failed");
@@ -418,7 +436,7 @@ export function createTelegramTransport(
           }
         } catch (error) {
           lastError = error;
-          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted) throw error;
+          if (error instanceof TelegramSendSuppressedError || attempt >= maxRetries || sendSignal?.aborted || (error as any)?.name === "AbortError") throw error;
           await sleep(250 * Math.pow(2, attempt));
         }
       }

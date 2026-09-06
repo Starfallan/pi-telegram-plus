@@ -749,7 +749,8 @@ export default function piTelegramPlus(pi: ExtensionAPI): void {
       }
     }
     requestCoordinatorReconcile();
-    try { await syncTelegramCommands(config.botToken, pi); } catch (err) { indexLog.debug("syncTelegramCommands on startup failed (non-critical)", { err }); }
+    // Fire-and-forget: Telegram API may be unreachable during startup; never block session init.
+    syncTelegramCommands(config.botToken, pi).catch((err) => indexLog.debug("syncTelegramCommands on startup failed (non-critical)", { err }));
     lastStatusError = undefined;
     heartbeat.startStatusHeartbeat(refreshStatus);
     refreshStatus();

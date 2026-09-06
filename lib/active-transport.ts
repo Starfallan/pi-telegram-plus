@@ -11,10 +11,20 @@ export function createActiveTelegramTransport(
 ): TelegramTransport {
     let tail: Promise<void> = Promise.resolve();
 
+    const WAIT_TIMEOUT_MS = 30_000;
+
     const run = <T>(fallback: T, operation: () => Promise<T>): Promise<T> => {
         const lease = deps.getLease?.();
         const result = tail.then(async () => {
-            await deps.waitUntilReady?.();
+            const ready = deps.waitUntilReady?.();
+            if (ready) {
+                await Promise.race([
+                    ready,
+                    new Promise<void>((_, reject) =>
+                        setTimeout(() => reject(new Error("waitUntilReady timed out")), WAIT_TIMEOUT_MS),
+                    ),
+                ]);
+            }
             if (!deps.isActive() || (deps.getLease && lease !== deps.getLease())) return fallback;
             try {
                 return await operation();
